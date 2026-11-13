@@ -1,0 +1,656 @@
+# Builds Bun with this repository's changes, tests the binary, and can publish
+# it as a release.
+#
+# Two things can be built:
+#
+# - An official release, with our changes on it (`tag: bun-v1.4.4`). The tag
+#   is checked out from oven-sh/bun, and the changes are put on it: the patch
+#   series pinned for that tag in stacks/patches/<tag>/ when there is one,
+#   otherwise everything this branch changes in Bun's own source, merged onto
+#   the tag three ways. This is what a release is made from.
+# - This branch as it is (no tag): upstream's main with our commits. Nothing
+#   is released from it. It is how a change, or a merge of upstream, is known
+#   to still build and pass before the next official release needs it.
+#
+# Every toolchain version is read from the tree being built
+# (scripts/build/ci-images/spec.ts `pins`, rust-toolchain.toml), so a new tag
+# picks up its own LLVM / Rust / bootstrap-bun pins without editing this file.
+#
+# See stacks/BUILDING.md for where each decision came from.
+
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Official oven-sh/bun release tag to build with our changes (empty builds this branch as it is)
+        type: string
+        required: false
+        default: ""
+      targets:
+        description: Which targets to build (a release needs all of them)
+        type: choice
+        options:
+          - all
+          - linux
+        default: all
+      lto:
+        description: Cross-language ThinLTO over C++ and JavaScriptCore (what upstream ships; needs far more memory at link)
+        type: boolean
+        default: false
+      publish:
+        description: Publish the result as a release of this repository (needs a tag, every target, and every test passing)
+        type: boolean
+        default: false
+
+run-name: Build ${{ inputs.tag || 'this branch' }}${{ inputs.targets == 'linux' && ' (linux)' || '' }}${{ inputs.publish && ' (publish)' || '' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    # Hosted runners stop a job at 360 minutes. Upstream's own budget for this
+    # step is 60 minutes on 16 vCPU / 128 GB.
+    timeout-minutes: 350
+    outputs:
+      patch_count: ${{ steps.patches.outputs.count }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runner: ubuntu-latest
+            ninja_jobs: 4
+            extra_flags: ""
+            # Empty = the default targets (stripped `bun`, which pulls the link and its checks).
+            final_target: ""
+          - target: darwin-aarch64
+            runner: macos-15
+            ninja_jobs: 3
+            # Upstream ships macOS binaries with the 13.0 floor (MIN_OSX_DEPLOYMENT_TARGET,
+            # applied automatically only under --ci=on). A local build would otherwise
+            # target the runner SDK's major version.
+            extra_flags: --osx-deployment-target=13.0
+            # The stripped binary only. The default targets on macOS also run dsymutil
+            # over bun-profile, which this experiment does not need.
+            final_target: --target=bun
+        # `targets: linux` leaves the macOS job out: GitHub's macOS arm64
+        # runners can be short, and a look at whether this branch still builds
+        # does not have to wait for one.
+        exclude:
+          - target: ${{ inputs.targets == 'linux' && 'darwin-aarch64' || 'none' }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      TRIPLET: bun-${{ matrix.target }}
+      # --canary=off: build.ts defaults canary ON; upstream passes this for releases.
+      # --lto=off still leaves the Rust crates as ThinLTO bitcode that the link optimises.
+      BUILD_FLAGS: --profile=release --canary=off --lto=${{ inputs.lto && 'on' || 'off' }} ${{ matrix.extra_flags }}
+      NINJA_JOBS: ${{ matrix.ninja_jobs }}
+      UPSTREAM_TAG: ${{ inputs.tag }}
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
+
+    steps:
+      # ───────────────────────────── machine ─────────────────────────────
+
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          df -h / /mnt 2>/dev/null || df -h /
+          # Preinstalled SDKs the build never touches. /opt/hostedtoolcache is kept
+          # apart from CodeQL: it holds the runner's Go, Python, Node and Ruby.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/share/swift \
+            /usr/local/share/powershell \
+            /usr/local/share/chromium \
+            /usr/local/share/boost \
+            /usr/lib/jvm \
+            /usr/share/miniconda \
+            /opt/microsoft \
+            /opt/google \
+            /opt/az
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h / /mnt 2>/dev/null || df -h /
+
+      - name: Free disk space (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          df -h /
+          sudo rm -rf "${ANDROID_HOME:-$HOME/Library/Android/sdk}" "$HOME/hostedtoolcache/CodeQL" || true
+          xcrun simctl delete all >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Add swap (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          free -h
+          sudo swapon --show || true
+          # Prefer the runner's temporary disk when it is there and roomy; the
+          # build itself lives on /.
+          dir=/
+          size_gb=16
+          if mountpoint -q /mnt; then
+            avail_gb="$(df --output=avail -BG /mnt | tail -n 1 | tr -dc '0-9')"
+            if [ "${avail_gb:-0}" -ge 40 ]; then
+              dir=/mnt
+              size_gb=24
+            fi
+          fi
+          swapfile="${dir%/}/swapfile-bun-build"
+          sudo fallocate -l "${size_gb}G" "$swapfile" \
+            || sudo dd if=/dev/zero of="$swapfile" bs=1M count="$((size_gb * 1024))" status=none
+          sudo chmod 600 "$swapfile"
+          sudo mkswap "$swapfile"
+          sudo swapon "$swapfile"
+          sudo swapon --show
+          free -h
+
+      # ───────────────────────────── sources ─────────────────────────────
+
+      - name: Check out this repository (the tests, and the changes to put on a tag)
+        uses: actions/checkout@v7
+        with:
+          path: fork
+          persist-credentials: false
+
+      - name: Check out what is built (the official tag, or this branch)
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.tag != '' && 'oven-sh/bun' || github.repository }}
+          ref: ${{ inputs.tag != '' && inputs.tag || github.sha }}
+          path: bun
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Put our changes on the tag
+        id: patches
+        working-directory: bun
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          fork="$GITHUB_WORKSPACE/fork"
+          if [ -z "$UPSTREAM_TAG" ]; then
+            echo "Building this branch as it is: $(git rev-parse HEAD)"
+            how="this branch"
+          else
+            echo "Upstream ${UPSTREAM_TAG} is $(git rev-parse HEAD)"
+            ident=(-c user.name="bun-fork-ci" -c user.email="bun-fork-ci@users.noreply.github.com")
+            # Dates pinned to the tag's, so the patched HEAD (which becomes
+            # `bun --revision`) is the same sha on every run.
+            GIT_COMMITTER_DATE="$(git log -1 --format=%cI)"
+            GIT_AUTHOR_DATE="$GIT_COMMITTER_DATE"
+            export GIT_COMMITTER_DATE GIT_AUTHOR_DATE
+            pinned=("$fork"/stacks/patches/"$UPSTREAM_TAG"/*.patch)
+            if (( ${#pinned[@]} > 0 )); then
+              # This tag has its own series: what was tested and released on it.
+              printf 'Applying %s\n' "${pinned[@]}"
+              git "${ident[@]}" am --3way "${pinned[@]}"
+              how="the ${#pinned[@]} patch(es) pinned for ${UPSTREAM_TAG}"
+            else
+              # Everything this branch changes in Bun's own source: the
+              # difference between it and the upstream commit it last merged
+              # (stacks/UPSTREAM), leaving out what is only the fork's
+              # (.github, stacks/). Merged onto the tag three ways, so what
+              # upstream changed elsewhere between the two is the tag's.
+              base="$(tr -d '[:space:]' < "$fork/stacks/UPSTREAM")"
+              echo "This branch's changes since upstream ${base}"
+              git -C "$fork" fetch --quiet --depth 1 origin "$base"
+              git -C "$fork" diff --binary "$base" HEAD -- . ':(exclude).github' ':(exclude)stacks' > "$RUNNER_TEMP/stacks.patch"
+              git -C "$fork" diff --stat "$base" HEAD -- . ':(exclude).github' ':(exclude)stacks'
+              # The blobs the changes were made against, for the three-way merge.
+              git fetch --quiet --depth 1 origin "$base"
+              if ! git apply --3way --index "$RUNNER_TEMP/stacks.patch"; then
+                echo "::error::This branch's changes do not merge onto ${UPSTREAM_TAG}. Upstream changed the same code between the tag and ${base}: add a series for this tag under stacks/patches/${UPSTREAM_TAG}/."
+                git status --short | head -n 40
+                exit 1
+              fi
+              git "${ident[@]}" commit --quiet -m "stacksjs/bun: the changes of $(git -C "$fork" rev-parse --short HEAD) on ${UPSTREAM_TAG}"
+              how="this branch's changes since upstream ${base:0:12}"
+            fi
+          fi
+          echo "BUN_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "PATCHED_WITH=${how}" >> "$GITHUB_ENV"
+          # Our changes are always in what is built: there is no unpatched build any more.
+          echo "PATCH_COUNT=1" >> "$GITHUB_ENV"
+          echo "count=1" >> "$GITHUB_OUTPUT"
+
+      # ──────────────────────────── toolchain ────────────────────────────
+
+      - name: Install system packages (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # The "Building Bun and its dependencies" group of aptPackages in
+          # scripts/build/ci-images/spec.ts, minus ccache (a one-shot build gains
+          # nothing from it) and golang (nothing in scripts/build looks it up;
+          # the runner's own Go stays on PATH regardless).
+          sudo apt-get update -qq
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential curl git libtool make nasm ninja-build perl pkg-config python3 ruby unzip xz-utils zip
+          command -v cmake >/dev/null || sudo apt-get install --yes --no-install-recommends cmake
+          cmake --version | head -n 1
+
+      - name: Install system packages (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # brewPackages in spec.ts, minus nasm (x64 only), golang and ccache.
+          for formula in cmake ninja pkg-config; do
+            brew list --formula "$formula" >/dev/null 2>&1 || brew install --quiet --formula "$formula"
+          done
+          cmake --version | head -n 1
+          xcode-select -p
+          xcodebuild -version || true
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          xcrun --sdk macosx --show-sdk-version || true
+
+      - name: Install the bootstrap bun the tag pins
+        working-directory: bun
+        run: |
+          spec=scripts/build/ci-images/spec.ts
+          case "${RUNNER_OS}-${RUNNER_ARCH}" in
+            Linux-X64)   platform=linux-x64 ;;
+            Linux-ARM64) platform=linux-aarch64 ;;
+            macOS-ARM64) platform=darwin-aarch64 ;;
+            macOS-X64)   platform=darwin-x64 ;;
+            *) echo "::error::No bootstrap bun for ${RUNNER_OS}-${RUNNER_ARCH}"; exit 1 ;;
+          esac
+          # pins.bun in spec.ts: `version: "x.y.z"` and one sha256 per platform.
+          version="$(awk '/^  bun: \{/{f=1} f && $1=="version:"{gsub(/[^0-9.]/,"",$2); print $2; exit}' "$spec")"
+          sha256="$(awk -v k="\"${platform}\":" '/^  bun: \{/{f=1} f && $1==k{gsub(/[",]/,"",$2); print $2; exit}' "$spec")"
+          if [ -z "$version" ] || [ -z "$sha256" ]; then
+            echo "::error::Could not read pins.bun from $spec"
+            exit 1
+          fi
+          echo "Bootstrap bun ${version} (${platform})"
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$RUNNER_TEMP/bun.zip" \
+            "https://github.com/oven-sh/bun/releases/download/bun-v${version}/bun-${platform}.zip"
+          echo "${sha256}  $RUNNER_TEMP/bun.zip" | shasum -a 256 -c -
+          unzip -q -o "$RUNNER_TEMP/bun.zip" -d "$RUNNER_TEMP/bun-bootstrap"
+          # ~/.bun/bin is the first place scripts/build/tools.ts findBun() looks.
+          mkdir -p "$HOME/.bun/bin"
+          install -m 755 "$RUNNER_TEMP/bun-bootstrap/bun-${platform}/bun" "$HOME/.bun/bin/bun"
+          ln -sf bun "$HOME/.bun/bin/bunx"
+          rm -rf "$RUNNER_TEMP/bun.zip" "$RUNNER_TEMP/bun-bootstrap"
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+          "$HOME/.bun/bin/bun" --version
+
+      - name: Read the tag's toolchain pins
+        working-directory: bun
+        run: |
+          # spec.ts reads nothing from the machine and only runs its generator
+          # under import.meta.main, so importing it is side-effect free.
+          bun -e '
+          const { pins } = await import(process.cwd() + "/scripts/build/ci-images/spec.ts");
+          const arch = process.arch === "arm64" ? "aarch64" : "x64";
+          const llvmArch = arch === "x64" ? "X64" : "ARM64";
+          const debArch = arch === "x64" ? "amd64" : "arm64";
+          const mirror = arch === "x64" ? "http://archive.ubuntu.com/ubuntu" : "http://ports.ubuntu.com/ubuntu-ports";
+          const icu = pins.llvm.icu;
+          const lines = [
+            "LLVM_VERSION=" + pins.llvm.version,
+            "LLVM_MAJOR=" + pins.llvm.version.split(".")[0],
+            "LLVM_ASSET=LLVM-" + pins.llvm.version + "-Linux-" + llvmArch + ".tar.xz",
+            "LLVM_SHA256=" + pins.llvm.sha256[arch],
+            "ICU_DEB_URL=" + mirror + "/pool/main/" + icu.directory + "/" + icu.name + "_" + icu.version + "_" + debArch + ".deb",
+            "ICU_DEB_SHA256=" + icu.sha256[arch],
+            "RUST_CHANNEL=" + pins.rust.channel,
+          ];
+          console.log(lines.join("\n"));
+          ' | tee -a "$GITHUB_ENV"
+
+      - name: Install LLVM (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # What the `llvm` tool of spec.ts does on Debian/Ubuntu: LLVM's own
+          # release tarball, checked against the pinned sha256, only the programs
+          # the build uses plus clang's resource directory, into /opt/llvm.
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$RUNNER_TEMP/llvm.tar.xz" \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/${LLVM_ASSET}"
+          echo "${LLVM_SHA256}  $RUNNER_TEMP/llvm.tar.xz" | sha256sum -c -
+          root="${LLVM_ASSET%.tar.xz}"
+          programs=(
+            "clang-${LLVM_MAJOR}" clang clang++ clang-cl clang-cpp clang-format clang-tidy
+            lld ld.lld ld64.lld lld-link wasm-ld
+            llvm-ar llvm-ranlib llvm-lib llvm-dlltool
+            llvm-objcopy llvm-strip llvm-install-name-tool llvm-bitcode-strip
+            llvm-nm llvm-readobj llvm-readelf llvm-objdump llvm-otool llvm-size llvm-strings
+            llvm-cxxfilt llvm-symbolizer llvm-addr2line llvm-dwarfdump llvm-config
+            llvm-cov llvm-profdata
+            dsymutil llvm-lipo llvm-rc llvm-windres llvm-mt llvm-ml llvm-cvtres llvm-pdbutil
+          )
+          members=()
+          for program in "${programs[@]}"; do members+=("${root}/bin/${program}"); done
+          members+=("${root}/lib/clang/${LLVM_MAJOR}")
+          sudo mkdir -p /opt/llvm
+          sudo tar -xJf "$RUNNER_TEMP/llvm.tar.xz" -C /opt/llvm --strip-components=1 "${members[@]}"
+          rm -f "$RUNNER_TEMP/llvm.tar.xz"
+
+          # LLVM's Linux release links lld and llvm-mt against ICU 70 (jammy's).
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$RUNNER_TEMP/libicu.deb" "$ICU_DEB_URL"
+          echo "${ICU_DEB_SHA256}  $RUNNER_TEMP/libicu.deb" | sha256sum -c -
+          sudo apt-get install --yes "$RUNNER_TEMP/libicu.deb"
+          rm -f "$RUNNER_TEMP/libicu.deb"
+
+          echo "/opt/llvm/bin" >> "$GITHUB_PATH"
+          /opt/llvm/bin/clang --version
+          /opt/llvm/bin/ld.lld --version
+          /opt/llvm/bin/llvm-ar --version | head -n 2
+          du -sh /opt/llvm
+
+      - name: Install LLVM (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # Homebrew can only be asked for a major; scripts/build/tools.ts accepts
+          # any release of the pinned major.minor series and looks in this keg itself.
+          brew install --quiet --formula "llvm@${LLVM_MAJOR}"
+          keg="$(brew --prefix)/opt/llvm@${LLVM_MAJOR}/bin"
+          echo "$keg" >> "$GITHUB_PATH"
+          "$keg/clang" --version
+          "$keg/dsymutil" --version | head -n 2
+
+      - name: Install the pinned Rust nightly
+        working-directory: ${{ runner.temp }}
+        run: |
+          # Run outside the checkout on purpose: inside it, a bare `rustc` or
+          # `cargo` makes rustup install every component and all 11 cross targets
+          # of rust-toolchain.toml (~2.4 GB). The build only needs the channel
+          # plus rust-src (std is rebuilt from source with -Zbuild-std).
+          if ! command -v rustup >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup --version
+          rustup toolchain install "$RUST_CHANNEL" --no-self-update --profile minimal --component rust-src
+          RUSTUP_TOOLCHAIN="$RUST_CHANNEL" rustc -vV
+          RUSTUP_TOOLCHAIN="$RUST_CHANNEL" cargo --version
+
+      - name: Toolchain sanity check (Linux)
+        if: runner.os == 'Linux'
+        working-directory: ${{ runner.temp }}
+        run: |
+          # Fail in seconds, not half an hour in, if clang cannot find a C++20
+          # libstdc++ or the static libstdc++/libatomic bun links.
+          printf '%s\n' '#include <atomic>' '#include <span>' '#include <cstdio>' \
+            'int main() { std::atomic<long long> a{1}; int v[2] = {1, 2}; std::span<int> s(v); std::printf("%d %lld\n", (int)s.size(), a.load()); }' \
+            > sanity.cpp
+          clang++ -std=c++23 -O2 sanity.cpp -o sanity \
+            --ld-path="$(command -v ld.lld)" -static-libstdc++ -static-libgcc -l:libatomic.a
+          ./sanity
+          clang++ -v 2>&1 | grep -i 'selected gcc' || true
+          ldd --version | head -n 1
+
+      # ────────────────────────────── build ──────────────────────────────
+
+      - name: Write the build wrapper
+        run: |
+          # One command line and one environment for every invocation: the
+          # revision is compiled into bun_core, so configure must see the same
+          # inputs each time or the Rust crates rebuild.
+          #
+          # - CI / GITHUB_ACTIONS unset: scripts/buildkite.ts treats either as
+          #   "CI" and build.ts then takes its Buildkite-shaped path (environment
+          #   dump, repository lookups, annotations). Unset, it takes the plain
+          #   path every contributor's `bun run build:release` takes.
+          # - GITHUB_SHA unset, GIT_SHA set: config.ts getGitRevision() reads
+          #   BUILDKITE_COMMIT ?? GITHUB_SHA ?? GIT_SHA before asking git, and
+          #   GITHUB_SHA here is this repository's commit, not Bun's.
+          cat > "$RUNNER_TEMP/bun-build.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/bun"
+          ulimit -n 16384 2>/dev/null || true
+          # shellcheck disable=SC2086
+          exec env -u CI -u GITHUB_ACTIONS -u GITHUB_SHA GIT_SHA="$BUN_SHA" \
+            bun scripts/build.ts $BUILD_FLAGS "$@"
+          EOF
+          chmod +x "$RUNNER_TEMP/bun-build.sh"
+          cat "$RUNNER_TEMP/bun-build.sh"
+
+      - name: Start memory and disk monitor
+        run: |
+          log="$RUNNER_TEMP/memory.log"
+          if [ "$RUNNER_OS" = Linux ]; then
+            sample='date -u +%H:%M:%S; free -m | sed -n 2,3p; df -h / | tail -n 1'
+          else
+            sample='date -u +%H:%M:%S; sysctl -n vm.swapusage; vm_stat | sed -n 2,6p; df -h / | tail -n 1'
+          fi
+          nohup bash -c "while true; do { $sample; echo; } 2>&1; sleep 30; done" > "$log" 2>&1 &
+          echo "Sampling every 30s into $log"
+
+      - name: Configure
+        run: |
+          "$RUNNER_TEMP/bun-build.sh" --configure-only
+
+      # Staged so the Rust crates and the C++ compiles do not compete for the
+      # same 16 GB, and so the step that fails names the phase.
+      - name: Build the Rust crates
+        run: |
+          "$RUNNER_TEMP/bun-build.sh" "-j${NINJA_JOBS}" --target=bun-rust
+
+      - name: Build C++, link, strip and check
+        run: |
+          "$RUNNER_TEMP/bun-build.sh" "-j${NINJA_JOBS}" ${{ matrix.final_target }}
+
+      # ───────────────────────────── results ─────────────────────────────
+
+      - name: Print version and revision
+        working-directory: bun
+        run: |
+          exe=build/release/bun
+          ls -l build/release/bun build/release/bun-profile
+          file "$exe" || true
+          version="$("$exe" --version)"
+          revision="$("$exe" --revision)"
+          echo "bun --version:  $version"
+          echo "bun --revision: $revision"
+          expected="$(sed -n 's/^  "version": "\(.*\)",$/\1/p' package.json | head -n 1)"
+          if [ "$version" != "$expected" ]; then
+            echo "::warning::bun --version is '$version' but package.json says '$expected' (canary still on?)"
+          fi
+          case "$revision" in
+            *"${BUN_SHA:0:7}"*) ;;
+            *) echo "::warning::bun --revision '$revision' does not contain the built commit ${BUN_SHA:0:7}" ;;
+          esac
+          if [ "$RUNNER_OS" = Linux ]; then
+            # Upstream's ceiling is GLIBC_2.17, which it gets from a glibc 2.31
+            # sysroot. This build links against the runner's glibc (see NOTES.md).
+            floor="$(objdump -T "$exe" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -n 1 || true)"
+            echo "Highest glibc symbol version required: ${floor:-unknown}"
+          fi
+          {
+            echo "### ${TRIPLET}"
+            echo ""
+            echo "- source: \`${UPSTREAM_TAG:-this branch}\`, commit \`${BUN_SHA}\`, with ${PATCHED_WITH}"
+            echo "- flags: \`${BUILD_FLAGS}\`"
+            echo "- \`bun --version\`: \`${version}\`"
+            echo "- \`bun --revision\`: \`${revision}\`"
+            echo "- size: $(wc -c < "$exe") bytes"
+            if [ "$RUNNER_OS" = Linux ]; then echo "- glibc floor: \`${floor:-unknown}\`"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Package in upstream's layout
+        working-directory: bun/build/release
+        run: |
+          # scripts/build/ci.ts makeZip(): <triplet>.zip holding <triplet>/bun,
+          # written with cmake's zip writer.
+          rm -rf "$TRIPLET" "$TRIPLET.zip"
+          mkdir "$TRIPLET"
+          cp bun "$TRIPLET/bun"
+          if [ "$RUNNER_OS" = macOS ] && [ -f "$GITHUB_WORKSPACE/bun/entitlements.plist" ]; then
+            # Guess, for parity with upstream's cross-built macOS binary, whose
+            # ad-hoc signature carries entitlements.plist (scripts/build/shims.ts).
+            # A native link is ad-hoc signed without them.
+            if codesign --force --sign - --entitlements "$GITHUB_WORKSPACE/bun/entitlements.plist" "$TRIPLET/bun" \
+              && "$TRIPLET/bun" --revision; then
+              codesign --display --entitlements - "$TRIPLET/bun" || true
+            else
+              echo "::warning::codesign with entitlements failed; packaging the binary as the build left it"
+              cp -f bun "$TRIPLET/bun"
+            fi
+          fi
+          cmake -E tar cfv "$TRIPLET.zip" --format=zip "$TRIPLET"
+          rm -rf "$TRIPLET"
+          unzip -l "$TRIPLET.zip"
+          shasum -a 256 "$TRIPLET.zip"
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: bun-${{ matrix.target }}
+          path: bun/build/release/bun-${{ matrix.target }}.zip
+          if-no-files-found: error
+
+      # ────────────────────────────── tests ──────────────────────────────
+      # What the patches add, run by the binary that was just built, against a
+      # real PostgreSQL and a real MySQL. Nothing is released that did not
+      # pass: the release job needs every target's job, and these are its last
+      # steps. After the upload, so a binary that fails them can be fetched
+      # and looked at.
+
+      - name: Start PostgreSQL and MySQL (Linux)
+        if: runner.os == 'Linux' && env.PATCH_COUNT != '0'
+        run: |
+          docker run -d --name pg -e POSTGRES_HOST_AUTH_METHOD=trust -p 5432:5432 postgres:17
+          docker run -d --name my -e MYSQL_ALLOW_EMPTY_PASSWORD=yes -e MYSQL_DATABASE=test -p 3306:3306 mysql:8.4
+          for i in $(seq 1 90); do
+            if docker exec pg pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1 \
+              && docker exec my mysqladmin ping -h 127.0.0.1 -uroot --silent >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          docker exec pg pg_isready -U postgres -h 127.0.0.1
+          docker exec my mysqladmin ping -h 127.0.0.1 -uroot
+          echo "POSTGRES_URL=postgres://postgres@127.0.0.1:5432/postgres" >> "$GITHUB_ENV"
+          echo "MYSQL_URL=mysql://root@127.0.0.1:3306/test" >> "$GITHUB_ENV"
+
+      - name: Start PostgreSQL and MySQL (macOS)
+        if: runner.os == 'macOS' && env.PATCH_COUNT != '0'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          brew install postgresql@17 mysql
+          brew services start postgresql@17
+          brew services start mysql
+          pg_bin="$(brew --prefix postgresql@17)/bin"
+          for i in $(seq 1 90); do
+            if "$pg_bin/pg_isready" -h 127.0.0.1 >/dev/null 2>&1 \
+              && mysqladmin ping -h 127.0.0.1 -uroot --silent >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          "$pg_bin/pg_isready" -h 127.0.0.1
+          mysqladmin ping -h 127.0.0.1 -uroot
+          mysql -h 127.0.0.1 -uroot -e 'create database if not exists test'
+          echo "POSTGRES_URL=postgres://$(whoami)@127.0.0.1:5432/postgres" >> "$GITHUB_ENV"
+          echo "MYSQL_URL=mysql://root@127.0.0.1:3306/test" >> "$GITHUB_ENV"
+
+      - name: Run the tests with the built binary
+        if: env.PATCH_COUNT != '0'
+        working-directory: fork/stacks
+        env:
+          SYNC_SQL_REQUIRE: "1"
+        run: |
+          "$GITHUB_WORKSPACE/bun/build/release/bun" --revision
+          "$GITHUB_WORKSPACE/bun/build/release/bun" test tests/
+
+      # ─────────────────────────── diagnostics ───────────────────────────
+
+      - name: Build timings
+        if: always()
+        continue-on-error: true
+        run: |
+          # Reads what the build left in the directory (.ninja_log); builds nothing.
+          # Writes build/release/timings.html.
+          if [ -f "$GITHUB_WORKSPACE/bun/build/release/build.ninja" ]; then
+            "$RUNNER_TEMP/bun-build.sh" --configure-only --timings
+          fi
+
+      - name: Memory, disk and OOM report
+        if: always()
+        continue-on-error: true
+        run: |
+          echo "::group::Last memory samples"
+          tail -n 60 "$RUNNER_TEMP/memory.log" 2>/dev/null || true
+          echo "::endgroup::"
+          if [ "$RUNNER_OS" = Linux ]; then
+            echo "::group::Peak usage (MiB)"
+            awk '/^Mem:/ { if ($3 > m) m = $3 } /^Swap:/ { if ($3 > s) s = $3 } END { print "peak RAM used: " m "  peak swap used: " s }' \
+              "$RUNNER_TEMP/memory.log" 2>/dev/null || true
+            echo "::endgroup::"
+            echo "::group::Kernel OOM kills"
+            sudo dmesg -T 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process' | tail -n 20 || echo "none recorded"
+            echo "::endgroup::"
+          fi
+          echo "::group::Disk"
+          df -h / /mnt 2>/dev/null || df -h /
+          du -sh "$GITHUB_WORKSPACE/bun/build" "$HOME/.bun/build-cache" "$HOME/.rustup" 2>/dev/null || true
+          echo "::endgroup::"
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: diagnostics-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/memory.log
+            bun/build/release/timings.html
+          if-no-files-found: ignore
+
+  # A release is "that official tag, plus our changes", built and tested on
+  # every target. This branch as it is is never released.
+  release:
+    name: Publish
+    # Each target's build job ends with the tests: a target that failed them did not succeed.
+    needs: build
+    if: ${{ inputs.publish && inputs.tag != '' && inputs.targets != 'linux' && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the binaries
+        uses: actions/download-artifact@v7
+        with:
+          pattern: bun-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          ls -la
+          sha256sum bun-*.zip > SHASUMS256.txt
+          cat SHASUMS256.txt
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ inputs.tag }}
+          PATCH_COUNT: ${{ needs.build.outputs.patch_count }}
+        run: |
+          set -euo pipefail
+          # <official tag>-stacks.<n>: n counts our releases of that tag.
+          existing="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName --jq '.[].tagName' | grep -c "^${UPSTREAM_TAG}-stacks\\." || true)"
+          name="${UPSTREAM_TAG}-stacks.$((existing + 1))"
+          gh release create "$name" dist/bun-*.zip dist/SHASUMS256.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$name" \
+            --notes "Bun ${UPSTREAM_TAG} with the changes of this repository at ${GITHUB_SHA}: query.wait(), query.executeSync(), query.cancelSync() and sql.reserveSync() on the MySQL and Postgres drivers. Built and tested by run ${GITHUB_RUN_ID}."
+

@@ -1,0 +1,1270 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Chris <chrisbreuer93@gmail.com>
+Date: Fri, 13 Nov 2026 03:15:33 -0800
+Subject: [PATCH] sql: a query can be waited for without the event loop
+
+query.wait(ms), query.executeSync(ms) and sql.reserveSync(ms) block the
+calling thread on the socket of the one connection that has the answer,
+and handle exactly what arrives on it. The loop does not turn, so nothing
+else of the program runs in the middle of the caller's statement.
+
+- usockets: us_socket_pump / us_connecting_socket_pump wait on one file
+  descriptor and dispatch it as a tick would, TLS and connect included.
+- PostgresSQLConnection and MySQLConnection get pump(ms).
+- A name looked up for a SQL connection is resolved on the thread pool,
+  whose answer the pump can see without a tick.
+---
+ packages/bun-usockets/src/crypto/openssl.c    |  41 +++
+ packages/bun-usockets/src/loop.c              | 245 +++++++++++++++++
+ src/js/bun/sql.ts                             |  51 +++-
+ src/js/internal/sql/pool.ts                   | 250 ++++++++++++++++--
+ src/js/internal/sql/query.ts                  |  97 ++++++-
+ src/runtime/api/sql.classes.ts                |   8 +
+ src/runtime/dns_jsc/dns.rs                    |  13 +-
+ src/sql_jsc/lib.rs                            |   2 +
+ src/sql_jsc/mysql/JSMySQLConnection.bind.ts   |   1 +
+ src/sql_jsc/mysql/JSMySQLConnection.rs        |  17 ++
+ src/sql_jsc/postgres/PostgresSQLConnection.rs |  85 +++++-
+ src/sql_jsc/shared/pump.rs                    |  66 +++++
+ 12 files changed, 841 insertions(+), 35 deletions(-)
+ create mode 100644 src/sql_jsc/shared/pump.rs
+
+diff --git a/packages/bun-usockets/src/crypto/openssl.c b/packages/bun-usockets/src/crypto/openssl.c
+index c19e063..c607d7f 100644
+--- a/packages/bun-usockets/src/crypto/openssl.c
++++ b/packages/bun-usockets/src/crypto/openssl.c
+@@ -523,6 +523,47 @@ void us_internal_ssl_loop_state_restore(void **saved) {
+   d->ssl_write_batching = (int)(uintptr_t)saved[5];
+ }
+ 
++/* us_socket_pump (loop.c) dispatches one socket from wherever its caller is,
++ * which can be the middle of another socket's read (stacksjs/bun). That read's
++ * state is the loop's: where its ciphertext is, whose it is, and the buffer
++ * its plaintext is in, which its caller is still consuming. All of it is set
++ * aside for the dispatch, which gets a plaintext buffer of its own, and put
++ * back after it. `saved` has US_PUMP_SSL_STATE_SLOTS slots (loop.c). */
++void us_internal_ssl_pump_enter(struct us_loop_t *loop, void **saved);
++void us_internal_ssl_pump_leave(struct us_loop_t *loop, void **saved);
++static char *ssl_alloc_read_output(void);
++
++void us_internal_ssl_pump_enter(struct us_loop_t *loop, void **saved) {
++  struct loop_ssl_data *d = (struct loop_ssl_data *)loop->data.ssl_data;
++  saved[0] = d;
++  /* No TLS socket has been on this loop: there is no read to protect. */
++  if (!d) return;
++  saved[1] = (void *)d->ssl_socket;
++  saved[2] = (void *)d->ssl_read_input;
++  saved[3] = (void *)(uintptr_t)d->ssl_read_input_length;
++  saved[4] = (void *)(uintptr_t)d->ssl_read_input_offset;
++  saved[5] = (void *)(uintptr_t)d->ssl_write_batching;
++  saved[6] = (void *)d->ssl_read_output;
++  /* As us_internal_ssl_loop_state_save: a write for another socket goes to
++   * that socket, and not onto the interrupted one's batch. */
++  d->ssl_write_batching = 0;
++  d->ssl_read_output = ssl_alloc_read_output();
++  if (!d->ssl_read_output) Bun__outOfMemory();
++}
++
++void us_internal_ssl_pump_leave(struct us_loop_t *loop, void **saved) {
++  struct loop_ssl_data *d = (struct loop_ssl_data *)saved[0];
++  /* The loop's TLS state was made inside the dispatch, or there is none. */
++  if (!d || d != (struct loop_ssl_data *)loop->data.ssl_data) return;
++  us_free(d->ssl_read_output);
++  d->ssl_socket = (struct us_socket_t *)saved[1];
++  d->ssl_read_input = (char *)saved[2];
++  d->ssl_read_input_length = (unsigned int)(uintptr_t)saved[3];
++  d->ssl_read_input_offset = (unsigned int)(uintptr_t)saved[4];
++  d->ssl_write_batching = (int)(uintptr_t)saved[5];
++  d->ssl_read_output = (char *)saved[6];
++}
++
+ /* A send() that no retry can save loses sealed records: nothing may follow them, but what the peer sent is still read. */
+ static int ssl_raw_write(struct loop_ssl_data *loop_ssl_data, struct us_socket_t *s, const char *data, int length) {
+   int send_error = 0;
+diff --git a/packages/bun-usockets/src/loop.c b/packages/bun-usockets/src/loop.c
+index abfdd6a..0a65bf5 100644
+--- a/packages/bun-usockets/src/loop.c
++++ b/packages/bun-usockets/src/loop.c
+@@ -1192,3 +1192,248 @@ __attribute__((always_inline)) void *us_loop_ext(struct us_loop_t *loop) {
+ }
+ 
+ #undef us_ioctl
++
++/* ── Waiting on one socket (stacksjs/bun) ──────────────────────────────────
++ *
++ * A synchronous database call has to wait for its answer without the event
++ * loop turning: a tick would run every other socket's callbacks, timers and
++ * tasks in the middle of the caller's statement. So the caller blocks on the
++ * one file descriptor its answer arrives on, and what that descriptor has is
++ * dispatched exactly as a tick would dispatch it (TLS included). Nothing else
++ * of the loop is touched: no other poll, no timer, no pre or post callback.
++ *
++ * The socket stays registered with the loop. What the loop later reports for
++ * an event that was already taken here is a read that finds nothing, which
++ * the dispatch tolerates.
++ *
++ * The caller can itself be inside a dispatch: a request handler that the HTTP
++ * parser called from the middle of a read, say. That read's bytes are in the
++ * loop's one receive buffer (and its plaintext in the loop's one TLS buffer),
++ * and the handler's caller goes on reading them when the handler returns. So
++ * a dispatch from inside another gets buffers of its own for as long as it
++ * runs, and the TLS layer's notion of whose read is under way is put back
++ * after it (us_internal_ssl_pump_enter).
++ *
++ * Returns 1 when something was dispatched, 0 when `timeout_ms` passed first
++ * (negative: no limit), -1 when there is nothing to wait on (closed).
++ */
++#ifndef LIBUS_USE_LIBUV
++#include <errno.h>
++#include <poll.h>
++
++int us_socket_pump(struct us_socket_t *s, int timeout_ms);
++int us_connecting_socket_pump(struct us_connecting_socket_t *c, int timeout_ms);
++void us_internal_dns_prefer_work_pool(int prefer);
++int us_internal_dns_prefers_work_pool(void);
++
++/* How much us_internal_ssl_pump_enter sets aside (crypto/openssl.c). */
++#define US_PUMP_SSL_STATE_SLOTS 8
++#ifndef LIBUS_NO_SSL
++void us_internal_ssl_pump_enter(struct us_loop_t *loop, void **saved);
++void us_internal_ssl_pump_leave(struct us_loop_t *loop, void **saved);
++#endif
++
++/* Bun's resolver cache answers a lookup on macOS through a connection to
++ * mDNSResponder that only a loop tick reads. A lookup started while this is
++ * set goes to the thread pool instead, whose answer us_connecting_socket_pump
++ * can see. */
++static _Thread_local int us_dns_prefer_work_pool_depth = 0;
++
++void us_internal_dns_prefer_work_pool(int prefer) {
++    us_dns_prefer_work_pool_depth += prefer ? 1 : -1;
++}
++
++int us_internal_dns_prefers_work_pool(void) {
++    return us_dns_prefer_work_pool_depth > 0;
++}
++
++/* The loop takes parked TLS handshakes back a few per tick
++ * (us_internal_handle_low_priority_sockets). No tick runs while a caller
++ * blocks here, so the one it waits for is taken back now. */
++static void us_internal_pump_unpark(struct us_loop_t *loop, struct us_socket_t *s) {
++    if (s->flags.low_prio_state != 1) {
++        return;
++    }
++    if (s == loop->data.low_prio_iterator) loop->data.low_prio_iterator = s->next;
++    if (s->prev) s->prev->next = s->next;
++    else loop->data.low_prio_head = s->next;
++    if (s->next) s->next->prev = s->prev;
++    s->prev = s->next = 0;
++    s->group->low_prio_count--;
++
++    us_internal_socket_group_link_socket(s->group, s);
++    if (s->flags.is_paused) {
++        s->flags.low_prio_state = 0;
++        return;
++    }
++    us_poll_change(&s->p, loop, us_poll_events(&s->p) | LIBUS_SOCKET_READABLE);
++    s->flags.low_prio_state = 2;
++}
++
++static int us_internal_pump_poll(struct pollfd *fds, int count, int timeout_ms) {
++    int ready;
++    do {
++        ready = poll(fds, (nfds_t) count, timeout_ms < 0 ? -1 : timeout_ms);
++    } while (ready < 0 && errno == EINTR);
++    return ready;
++}
++
++static void us_internal_pump_dispatch(struct us_loop_t *loop, struct us_socket_t *s, short revents) {
++    const int error = (revents & POLLERR) != 0;
++#ifdef LIBUS_USE_EPOLL
++    /* poll() and epoll report a hangup alike. */
++    const int eof = (revents & POLLHUP) ? LIBUS_POLL_HANGUP : 0;
++#else
++    /* As kqueue's EV_EOF on the read filter: the peer's FIN. */
++    const int eof = (revents & POLLHUP) ? LIBUS_POLL_EOF : 0;
++#endif
++    int events = ((revents & POLLIN) ? LIBUS_SOCKET_READABLE : 0)
++               | ((revents & POLLOUT) ? LIBUS_SOCKET_WRITABLE : 0);
++    events &= us_poll_events(&s->p);
++    if (!events && !error && !eof) {
++        return;
++    }
++    /* A handshake that the dispatch would park for the next tick's budget. */
++    if (loop->data.low_prio_budget < 1) {
++        loop->data.low_prio_budget = 1;
++    }
++    /* Inside a tick or another pump, a read may be under way further up the
++     * stack: its buffers are left as they are. */
++    const int nested = loop->data.tick_depth > 0;
++    char *outer_recv_buf = NULL;
++    void *outer_ssl[US_PUMP_SSL_STATE_SLOTS];
++    if (nested) {
++        outer_recv_buf = loop->data.recv_buf;
++        loop->data.recv_buf = us_malloc(LIBUS_RECV_BUFFER_LENGTH + LIBUS_RECV_BUFFER_PADDING * 2);
++        if (!loop->data.recv_buf) Bun__outOfMemory();
++#ifndef LIBUS_NO_SSL
++        us_internal_ssl_pump_enter(loop, outer_ssl);
++#else
++        (void) outer_ssl;
++#endif
++    }
++    /* As inside a tick: a callback that runs a nested tick must not free the
++     * socket this dispatch is still reading (us_internal_loop_post). */
++    loop->data.tick_depth++;
++    us_internal_dispatch_ready_poll(&s->p, error, eof, events);
++    loop->data.tick_depth--;
++    if (nested) {
++#ifndef LIBUS_NO_SSL
++        us_internal_ssl_pump_leave(loop, outer_ssl);
++#endif
++        us_free(loop->data.recv_buf);
++        loop->data.recv_buf = outer_recv_buf;
++    }
++}
++
++int us_socket_pump(struct us_socket_t *s, int timeout_ms) {
++    s = us_internal_socket_follow_adopted(s);
++    if (!s || us_socket_is_closed(s) || !s->group) {
++        return -1;
++    }
++    struct us_loop_t *loop = s->group->loop;
++    us_internal_pump_unpark(loop, s);
++
++    const int wanted = us_poll_events(&s->p);
++    struct pollfd pfd;
++    pfd.fd = us_poll_fd(&s->p);
++    pfd.events = (short) (((wanted & LIBUS_SOCKET_READABLE) ? POLLIN : 0)
++                        | ((wanted & LIBUS_SOCKET_WRITABLE) ? POLLOUT : 0));
++    pfd.revents = 0;
++
++    const int ready = us_internal_pump_poll(&pfd, 1, timeout_ms);
++    if (ready <= 0) {
++        return ready < 0 ? -1 : 0;
++    }
++    if (pfd.revents & POLLNVAL) {
++        return -1;
++    }
++    us_internal_pump_dispatch(loop, s, pfd.revents);
++    return 1;
++}
++
++#define US_PUMP_MAX_CANDIDATES 8
++
++int us_connecting_socket_pump(struct us_connecting_socket_t *c, int timeout_ms) {
++    if (c->closed) {
++        return -1;
++    }
++    struct us_loop_t *loop = c->loop;
++
++    if (c->pending_resolve_callback) {
++        /* The resolver puts `c` on the loop's list when it has the answer
++         * (us_internal_dns_callback), from another thread or from this one.
++         * The loop would take the whole list at its next tick; this takes `c`
++         * alone. */
++        int waited_ms = 0;
++        for (;;) {
++            int found = 0;
++            Bun__lock(&loop->data.mutex);
++            for (struct us_connecting_socket_t **link = &loop->data.dns_ready_head; *link; link = &(*link)->next) {
++                if (*link == c) {
++                    *link = c->next;
++                    c->next = NULL;
++                    found = 1;
++                    break;
++                }
++            }
++            Bun__unlock(&loop->data.mutex);
++            if (found) {
++                us_internal_socket_after_resolve(c);
++                return 1;
++            }
++            if (timeout_ms >= 0 && waited_ms >= timeout_ms) {
++                return 0;
++            }
++            struct timespec one_ms = { 0, 1000000 };
++            nanosleep(&one_ms, NULL);
++            waited_ms++;
++        }
++    }
++
++    /* One candidate per resolved address is connecting. The first to answer
++     * is dispatched; if it failed, the next call waits on the ones left. */
++    struct pollfd fds[US_PUMP_MAX_CANDIDATES];
++    struct us_socket_t *candidates[US_PUMP_MAX_CANDIDATES];
++    int count = 0;
++    for (struct us_socket_t *s = c->connecting_head; s && count < US_PUMP_MAX_CANDIDATES; s = s->connect_next) {
++        if (us_socket_is_closed(s)) {
++            continue;
++        }
++        fds[count].fd = us_poll_fd(&s->p);
++        fds[count].events = POLLOUT;
++        fds[count].revents = 0;
++        candidates[count++] = s;
++    }
++    if (count == 0) {
++        return -1;
++    }
++
++    const int ready = us_internal_pump_poll(fds, count, timeout_ms);
++    if (ready <= 0) {
++        return ready < 0 ? -1 : 0;
++    }
++    for (int i = 0; i < count; i++) {
++        if (fds[i].revents && !(fds[i].revents & POLLNVAL)) {
++            /* May free `c` and close the other candidates. */
++            us_internal_pump_dispatch(loop, candidates[i], fds[i].revents);
++            return 1;
++        }
++    }
++    return 0;
++}
++
++#else /* LIBUS_USE_LIBUV */
++
++int us_socket_pump(struct us_socket_t *s, int timeout_ms);
++int us_connecting_socket_pump(struct us_connecting_socket_t *c, int timeout_ms);
++void us_internal_dns_prefer_work_pool(int prefer);
++int us_internal_dns_prefers_work_pool(void);
++
++/* Not on libuv (Windows): the caller is told there is nothing to wait on. */
++int us_socket_pump(struct us_socket_t *s, int timeout_ms) { (void) s; (void) timeout_ms; return -1; }
++int us_connecting_socket_pump(struct us_connecting_socket_t *c, int timeout_ms) { (void) c; (void) timeout_ms; return -1; }
++void us_internal_dns_prefer_work_pool(int prefer) { (void) prefer; }
++int us_internal_dns_prefers_work_pool(void) { return 0; }
++
++#endif
+diff --git a/src/js/bun/sql.ts b/src/js/bun/sql.ts
+index b331c4e..9103ad7 100644
+--- a/src/js/bun/sql.ts
++++ b/src/js/bun/sql.ts
+@@ -21,7 +21,7 @@ const {
+   Query,
+   SQLQueryFlags,
+   onQuerySettled,
+-  symbols: { _flags, _strings, _waiter, _copy },
++  symbols: { _flags, _strings, _waiter, _copy, _pumped },
+ } = require("internal/sql/query");
+ const { PostgresAdapter } = require("internal/sql/postgres");
+ const { MySQLAdapter } = require("internal/sql/mysql");
+@@ -71,6 +71,7 @@ class Client implements Target {
+   flags: number;
+   handler: QueryHandler = dispatchToPool.bind(this);
+   reserve = reserve.bind(this);
++  reserveSync = reserveSync.bind(this);
+   listen = listen.bind(this);
+   array = array.bind(this);
+   json = json.bind(this);
+@@ -196,6 +197,7 @@ function runOn(pool: Pool, pooledConnection: PooledConnection | null, query: Que
+   try {
+     const connection = pool.getConnectionForQuery(pooledConnection);
+     query.active = true;
++    query[_pumped] = connection;
+     handle.run(connection, query);
+   } catch (err) {
+     query.reject(err as Error);
+@@ -871,6 +873,51 @@ function reserve(this: Client, options?: { signal?: AbortSignal }) {
+   return promise;
+ }
+ 
++/// reserve(), where it is called: blocks this thread until a connection is the caller's, without the event loop
++/// turning. undefined when none can be had that way within `ms` milliseconds: every connection is busy with
++/// something that only the event loop can finish. reserve() then waits for one.
++function reserveSync(this: Client, ms?: number): Bun.ReservedSQL | undefined {
++  const pool = this.pool as Pool & {
++    connectSync?: (done: () => boolean, ms: number | undefined) => boolean | null;
++    sweepSync?: () => void;
++  };
++  if (pool.closed) {
++    throw pool.connectionClosedError();
++  }
++  if (!pool.supportsReservedConnections || !pool.connectSync) {
++    throw new Error("This adapter doesn't support connection reservation");
++  }
++  pool.sweepSync?.();
++
++  let handle: Bun.ReservedSQL | undefined;
++  let failure: { error: unknown } | undefined;
++  const pending: PendingReservation = {
++    client: this,
++    signal: undefined,
++    resolve: reserved => {
++      handle = reserved;
++    },
++    reject: error => {
++      failure = { error };
++    },
++    onConnected: null,
++    onAbort: null,
++  };
++  const onConnected = (pending.onConnected = onReserveConnected.bind(pending));
++  pool.connect(onConnected, true);
++  if (handle === undefined && failure === undefined) {
++    pool.connectSync(() => handle !== undefined || failure !== undefined, ms);
++    // Still in the queue: it leaves it, and the caller owns nothing.
++    if (handle === undefined && failure === undefined) {
++      pool.cancelConnect(onConnected);
++    }
++  }
++  if (failure !== undefined) {
++    throw failure.error;
++  }
++  return handle;
++}
++
+ function validateChannel(channel: unknown): asserts channel is string {
+   if (typeof channel !== "string" || channel.length === 0) {
+     throw $ERR_INVALID_ARG_VALUE("channel", channel, "must be a non-empty string");
+@@ -999,6 +1046,7 @@ function makeHandle(target: Client | Scope) {
+   handle.rollbackDistributed = finishDistributed.bind(target, false);
+   // reserve() takes another connection from the pool, whatever it is called on, as in the postgres package
+   handle.reserve = client.reserve;
++  handle.reserveSync = client.reserveSync;
+   handle.listen = client.listen;
+   handle.array = client.array;
+   handle.json = client.json;
+@@ -1088,6 +1136,7 @@ const defaultSQLMembers = [
+   "commitDistributed",
+   "rollbackDistributed",
+   "reserve",
++  "reserveSync",
+   "listen",
+   "array",
+   "json",
+diff --git a/src/js/internal/sql/pool.ts b/src/js/internal/sql/pool.ts
+index ca54dbb..cb1cce5 100644
+--- a/src/js/internal/sql/pool.ts
++++ b/src/js/internal/sql/pool.ts
+@@ -7,7 +7,7 @@ type SQLResultArray<T> = import("./shared").SQLResultArray<T>;
+ const {
+   SQLQueryFlags,
+   onQuerySettled,
+-  symbols: { _results },
++  symbols: { _results, _pumped },
+ } = require("internal/sql/query");
+ const { SQLDialect, SQLResultArray, isUnsafeTransactionStart } = require("internal/sql/shared");
+ const AsyncContextFrame = require("internal/async_context_frame");
+@@ -39,6 +39,9 @@ interface NativeConnection {
+   readonly inTransaction: unknown;
+   /// PostgreSQL, a boolean: the server asked for SASL in the login that is under way or was refused
+   readonly sasl?: unknown;
++  /// Blocks the thread on this connection's socket for at most `ms` milliseconds (negative: no limit) and handles
++  /// what arrives. 1: something was handled, 0: the time passed, -1: there is nothing to wait on.
++  pump(ms: number): number;
+ }
+ 
+ /// A driver ignores the trailing arguments it does not take.
+@@ -76,6 +79,10 @@ export type NativeCreateQuery<QueryHandle> = (
+ 
+ type OnConnected = (err: Error | null, connection: any) => void;
+ 
++/// What a native dial threw where it was started, once a caller that blocks has dealt with it: the catch in
++/// PooledConnection#dial() is a microtask behind, and must not deal with it again.
++const handledDialErrors = new WeakSet<object>();
++
+ /// In the pool's queue: a caller that wants a connection for itself. A query is queued as its bare callback.
+ class Reservation {
+   onConnected: OnConnected;
+@@ -88,6 +95,8 @@ class Reservation {
+ class PooledConnection<ConnectionHandle extends NativeConnection = any> {
+   adapter: BaseSQLAdapter<ConnectionHandle, any>;
+   connection: ConnectionHandle | null = null;
++  /// The native connection of the dial under way, before `connection` is: that waits for a promise.
++  dialing: ConnectionHandle | null = null;
+   state: PooledConnectionState = PooledConnectionState.connecting;
+   closeHandlers: Set<(err: Error) => void> = new Set();
+   flags: number = 0;
+@@ -96,6 +105,11 @@ class PooledConnection<ConnectionHandle extends NativeConnection = any> {
+   connectStartedAt: number = monotonicNowMs();
+   connectAttempts: number = 0;
+   retryTimer: ReturnType<typeof setTimeout> | null = null;
++  /// What the native dial threw where it was started (nothing listens on a local port, say).
++  dialFailure: unknown = null;
++  /// When `retryTimer` fires, and what the dial that it follows failed with.
++  retryAt: number = 0;
++  retryError: Error | null = null;
+   saslprep: boolean;
+   otherPassword: boolean | undefined;
+   #releaseQuery: () => void;
+@@ -108,7 +122,7 @@ class PooledConnection<ConnectionHandle extends NativeConnection = any> {
+ 
+   async #startConnection() {
+     const adapter = this.adapter;
+-    this.connection = await createPooledConnectionHandle(
++    const connection = await createPooledConnectionHandle(
+       adapter.createNativeConnection,
+       adapter.connectionInfo,
+       adapter.ownerCallback(this.#handleConnected.bind(this)),
+@@ -116,6 +130,11 @@ class PooledConnection<ConnectionHandle extends NativeConnection = any> {
+       adapter.ownerCallback(this.#handleRetire.bind(this)),
+       this,
+     );
++    // A caller that blocked on this dial (BaseSQLAdapter#dialing) has seen it through before this microtask ran:
++    // it is open, or it failed and the next one is under way. Either way this one is not to be put back.
++    if (this.dialing === connection) {
++      this.connection = connection;
++    }
+   }
+ 
+   /// Connect failures (ERR_*_CONNECTION_FAILED) mean the server accepted the TCP connection but closed it before
+@@ -135,7 +154,10 @@ class PooledConnection<ConnectionHandle extends NativeConnection = any> {
+       await this.adapter.runAsOwner(this.#startConnection, this);
+     } catch (err) {
+       // nothing was dialed: the password function threw, or an option is refused
+-      this.#handleClose(err as Error);
++      this.dialFailure = null;
++      if (!($isObject(err) && handledDialErrors.has(err))) {
++        this.#handleClose(err as Error);
++      }
+     }
+     if (this.state === PooledConnectionState.closed) {
+       this.connection?.close();
+@@ -148,6 +170,7 @@ class PooledConnection<ConnectionHandle extends NativeConnection = any> {
+       return;
+     }
+     this.connection = connection;
++    this.dialing = null;
+     this.state = PooledConnectionState.open;
+     this.adapter.connectionOpened(this);
+   }
+@@ -156,14 +179,17 @@ class PooledConnection<ConnectionHandle extends NativeConnection = any> {
+     if (this.state === PooledConnectionState.closed) {
+       return;
+     }
+-    const connection = this.connection;
++    const connection = this.connection ?? this.dialing;
+     this.connection = null;
++    this.dialing = null;
+     if (this.state === PooledConnectionState.connecting && tryOtherPassword(this, err, connection)) {
+       this.dial();
+       return;
+     }
+     if (this.state === PooledConnectionState.connecting && this.#isConnectFailure(err) && this.#canKeepRetrying()) {
+       const delay = Math.min(20 * 2 ** ++this.connectAttempts, 1000);
++      this.retryAt = monotonicNowMs() + delay;
++      this.retryError = err;
+       this.retryTimer = setTimeout(PooledConnection.#retryTimerFired, delay, this, err);
+       return;
+     }
+@@ -192,8 +218,31 @@ class PooledConnection<ConnectionHandle extends NativeConnection = any> {
+     this.#releaseQuery = adapter.release.bind(adapter, this);
+   }
+ 
++  /// What the catch in dial() would do, now: for a caller that blocks, see BaseSQLAdapter#block().
++  failDialNow() {
++    const err = this.dialFailure;
++    if (err == null || this.state !== PooledConnectionState.connecting) {
++      return;
++    }
++    this.dialFailure = null;
++    if ($isObject(err)) {
++      handledDialErrors.add(err);
++    }
++    this.#handleClose(err as Error);
++  }
++
++  /// What `retryTimer` would do, now: for a caller that slept the pause itself, see BaseSQLAdapter#block().
++  retryNow() {
++    const timer = this.retryTimer;
++    if (timer !== null) {
++      clearTimeout(timer);
++      PooledConnection.#retryTimerFired(this, this.retryError);
++    }
++  }
++
+   static #retryTimerFired(self: PooledConnection, err: Error | null) {
+     self.retryTimer = null;
++    self.retryError = null;
+     if (self.#canKeepRetrying()) {
+       self.dial();
+     } else {
+@@ -394,7 +443,7 @@ async function createPooledConnectionHandle<ConnectionHandle>(
+   onConnected: (err: Error | null, connection: ConnectionHandle) => void,
+   onClose: (err: Error | null) => void,
+   onRetire: (() => void) | undefined,
+-  login: Login & { state?: PooledConnectionState },
++  login: Login & { state?: PooledConnectionState; dialing?: ConnectionHandle | null; dialFailure?: unknown },
+ ): Promise<ConnectionHandle | null> {
+   const {
+     hostname,
+@@ -437,29 +486,36 @@ async function createPooledConnectionHandle<ConnectionHandle>(
+   const prepared = saslprep(password);
+   login.otherPassword ??= options.adapter === "postgres" && prepared !== password;
+ 
+-  return nativeCreateConnection(
+-    hostname,
+-    Number(port),
+-    username || "",
+-    password,
+-    database || "",
+-    sslMode,
+-    (tls || null) as Bun.TLSOptions | true | null,
+-    query || "",
+-    path || "",
+-    onConnected,
+-    onClose,
+-    idleTimeout,
+-    connectionTimeout,
+-    maxLifetime,
+-    !prepare,
+-    !!allowPublicKeyRetrieval,
+-    onRetire,
+-    foundRows,
+-    channelBinding === "disable" ? 0 : channelBinding === "require" ? 2 : 1,
+-    transform?.column.from,
+-    login.saslprep ? prepared : password,
+-  );
++  // Where a caller that cannot wait for this promise finds the connection, or what the dial threw: see
++  // BaseSQLAdapter#dialing() and #block().
++  try {
++    return (login.dialing = nativeCreateConnection(
++      hostname,
++      Number(port),
++      username || "",
++      password,
++      database || "",
++      sslMode,
++      (tls || null) as Bun.TLSOptions | true | null,
++      query || "",
++      path || "",
++      onConnected,
++      onClose,
++      idleTimeout,
++      connectionTimeout,
++      maxLifetime,
++      !prepare,
++      !!allowPublicKeyRetrieval,
++      onRetire,
++      foundRows,
++      channelBinding === "disable" ? 0 : channelBinding === "require" ? 2 : 1,
++      transform?.column.from,
++      login.saslprep ? prepared : password,
++    ));
++  } catch (err) {
++    login.dialFailure = err;
++    throw err;
++  }
+ }
+ 
+ /// A result of several: CALL <proc>() and a text of several statements.
+@@ -894,6 +950,144 @@ abstract class BaseSQLAdapter<ConnectionHandle extends NativeConnection, QueryHa
+     }
+   }
+ 
++  /// The native connection of the first dial that is under way.
++  #dialing(): ConnectionHandle | null {
++    const connections = this.connections;
++    for (let i = 0; i < connections.length; i++) {
++      const connection = connections[i];
++      if (connection.state === PooledConnectionState.connecting) {
++        const native = connection.connection ?? connection.dialing;
++        if (native) {
++          return native;
++        }
++      }
++    }
++    return null;
++  }
++
++  /// A connection whose native dial threw, and that has not heard of it yet.
++  #failedDial(): PooledConnection | null {
++    const connections = this.connections;
++    for (let i = 0; i < connections.length; i++) {
++      const connection = connections[i];
++      if (connection.state === PooledConnectionState.connecting && connection.dialFailure != null) {
++        return connection;
++      }
++    }
++    return null;
++  }
++
++  /// The connection whose failed dial is tried again soonest, see PooledConnection#handleClose().
++  #retrying(): PooledConnection | null {
++    const connections = this.connections;
++    let soonest: PooledConnection | null = null;
++    for (let i = 0; i < connections.length; i++) {
++      const connection = connections[i];
++      if (connection.retryTimer !== null && (soonest === null || connection.retryAt < soonest.retryAt)) {
++        soonest = connection;
++      }
++    }
++    return soonest;
++  }
++
++  /// Blocks the thread until `done()`, for at most `ms` milliseconds, on one socket at a time: that of `native()`,
++  /// or of a dial that is under way. true: done. false: the time passed. null: neither socket is there, so what
++  /// is awaited takes the event loop (a connection that an awaited caller has to give back, a password that is
++  /// a promise).
++  #block(done: () => boolean, native: () => ConnectionHandle | null, ms: number | undefined): boolean | null {
++    const deadline = (ms as number) >= 0 ? monotonicNowMs() + (ms as number) : Infinity;
++    let closed: ConnectionHandle | null = null;
++    while (!done()) {
++      const connection = native() ?? this.#dialing();
++      // The close of a connection settles what was on it. One that says it is closed and still has what is
++      // waited for is not asked again.
++      if (connection === null || connection === closed) {
++        // A dial that threw where it was started is dealt with by a catch that is a microtask away.
++        const failed = this.#failedDial();
++        if (failed !== null) {
++          failed.failDialNow();
++          closed = null;
++          continue;
++        }
++        // A dial that failed while the server was starting is tried again after a pause, by a timer that needs
++        // the event loop. The pause is slept here, and the redial started.
++        const retrying = this.#retrying();
++        if (retrying === null) {
++          return null;
++        }
++        const now = monotonicNowMs();
++        if (deadline <= now) {
++          return false;
++        }
++        const pause = Math.min(retrying.retryAt, deadline) - now;
++        if (pause > 0) {
++          Bun.sleepSync(pause);
++        }
++        if (retrying.retryAt <= monotonicNowMs()) {
++          retrying.retryNow();
++        }
++        closed = null;
++        continue;
++      }
++      const left = deadline - monotonicNowMs();
++      if (left <= 0) {
++        return false;
++      }
++      if (connection.pump(left === Infinity ? -1 : Math.min(left, 2 ** 31 - 1)) < 0) {
++        closed = connection;
++      }
++    }
++    return true;
++  }
++
++  #sweptAt = 0;
++
++  /// Before a statement is waited for: what the idle connections have had since the event loop last turned is
++  /// taken now, at most once a second. A connection that the server closed meanwhile leaves the pool here, and
++  /// not under the statement. A program that never yields has no other moment for it.
++  sweepSync() {
++    const now = monotonicNowMs();
++    if (now - this.#sweptAt < 1000) {
++      return;
++    }
++    this.#sweptAt = now;
++    for (const connection of this.readyConnections) {
++      if (connection.queryCount === 0) {
++        connection.connection?.pump(0);
++      }
++    }
++  }
++
++  /// For Query.wait().
++  waitSync(query: QueryType<any, any>, ms: number | undefined): boolean | null {
++    return this.#block(
++      () => !$isPromisePending(query),
++      () => query[_pumped] as ConnectionHandle | null,
++      ms,
++    );
++  }
++
++  /// For Query.cancelSync(): blocks until the request to stop a statement on `native` has reached the server, for
++  /// at most `ms` milliseconds. PostgreSQL sends it on a connection of its own, which nothing else drives while
++  /// the caller does not yield. MySQL has no such request.
++  cancelSync(native: ConnectionHandle & { pumpCancel?: (ms: number) => number }, ms: number | undefined) {
++    if (!native.pumpCancel) {
++      return;
++    }
++    const deadline = (ms as number) >= 0 ? monotonicNowMs() + (ms as number) : Infinity;
++    for (;;) {
++      const left = deadline - monotonicNowMs();
++      if (left <= 0 || native.pumpCancel(left === Infinity ? -1 : Math.min(left, 2 ** 31 - 1)) < 0) {
++        return;
++      }
++    }
++  }
++
++  /// For reserveSync(): a caller is in the queue, and waits for a dial.
++  connectSync(done: () => boolean, ms: number | undefined): boolean | null {
++    return this.#block(done, () => null, ms);
++  }
++
+   isConnected() {
+     const connections = this.connections;
+     for (let i = 0; i < connections.length; i++) {
+diff --git a/src/js/internal/sql/query.ts b/src/js/internal/sql/query.ts
+index 067838a..ebe3b82 100644
+--- a/src/js/internal/sql/query.ts
++++ b/src/js/internal/sql/query.ts
+@@ -13,6 +13,10 @@ const _adapter = Symbol("adapter");
+ const _waiter = Symbol("waiter");
+ const _settled = Symbol("settled");
+ const _copy = Symbol("copy");
++const _onSettled = Symbol("onSettled");
++const _pumped = Symbol("pumped");
++const _outcome = Symbol("outcome");
++const _failed = Symbol("failed");
+ 
+ const PublicPromise = Promise;
+ 
+@@ -35,6 +39,13 @@ class Query<T, Handle extends BaseQueryHandle<any>> extends PublicPromise<T> {
+   public [_flags]: SQLQueryFlags;
+   public [_waiter]: ((err: Error | null, connection: any) => void) | null;
+   public [_settled]: Promise<void> | null;
++  /// The callbacks of onQuerySettled() that have not run. wait() runs them itself: no microtask runs while it blocks.
++  public [_onSettled]: Array<() => void> | null;
++  /// The native connection it runs on, for wait().
++  public [_pumped]: { pump(ms: number): number } | null;
++  /// What it settled with, for executeSync().
++  public [_outcome]: unknown;
++  public [_failed]: boolean;
+   /// What is behind the stream of a query with SQLQueryFlags.copy. No other query has the property.
+   declare public [_copy]: { attach(handle: Handle): void; abandon(why: string): void };
+ 
+@@ -112,6 +123,10 @@ class Query<T, Handle extends BaseQueryHandle<any>> extends PublicPromise<T> {
+     this[_flags] = flags;
+     this[_waiter] = null;
+     this[_settled] = null;
++    this[_onSettled] = null;
++    this[_pumped] = null;
++    this[_outcome] = undefined;
++    this[_failed] = false;
+ 
+     this[_results] = null;
+   }
+@@ -191,6 +206,9 @@ class Query<T, Handle extends BaseQueryHandle<any>> extends PublicPromise<T> {
+ 
+   resolve(x: T) {
+     this.#settling();
++    if ($isPromisePending(this)) {
++      this[_outcome] = x;
++    }
+ 
+     return this[_resolve](x);
+   }
+@@ -198,10 +216,53 @@ class Query<T, Handle extends BaseQueryHandle<any>> extends PublicPromise<T> {
+   reject(x: Error) {
+     this[_queryStatus] |= SQLQueryStatus.error;
+     this.#settling();
++    if ($isPromisePending(this)) {
++      this[_outcome] = x;
++      this[_failed] = true;
++    }
+ 
+     return this[_reject](x);
+   }
+ 
++  /// Starts the query and blocks this thread until it has settled, or for `ms` milliseconds. The event loop does
++  /// not turn meanwhile: the thread waits on the socket of the connection the query is on, and nothing else of
++  /// the program runs. true: it has settled. false: the time passed. null: there is nothing for the thread to
++  /// wait on, so only the event loop can settle it (every connection is in the hands of a caller that awaits,
++  /// say), and waiting longer here would not help.
++  wait(ms?: number): boolean | null {
++    if (!(this[_queryStatus] & (SQLQueryStatus.executed | SQLQueryStatus.error))) {
++      (this[_adapter] as { sweepSync?: () => void }).sweepSync?.();
++    }
++    this.#run();
++    // As with execute(): whoever waits this way reads the outcome from executeSync().
++    $pokePromiseAsHandled(this);
++    if ($isPromisePending(this)) {
++      const adapter = this[_adapter] as {
++        waitSync?: (query: Query<T, Handle>, ms: number | undefined) => boolean | null;
++      };
++      const waited = adapter.waitSync ? adapter.waitSync(this, ms) : null;
++      if ($isPromisePending(this)) {
++        return waited === null ? null : false;
++      }
++    }
++    runSettled.$call(this);
++    return true;
++  }
++
++  /// The result of the query, where it is called: wait(), then what the query resolved with, or a throw of what
++  /// it rejected with. A query that has not settled after `ms` milliseconds keeps running, and can be awaited.
++  executeSync(ms?: number): T {
++    if (!this.wait(ms)) {
++      const adapter = this[_adapter] as { error?: (code: string, message: string) => Error };
++      const message = "The query has not settled, and executeSync() cannot wait for it any longer";
++      throw adapter.error ? adapter.error("SYNC_TIMEOUT", message) : new Error(message);
++    }
++    if (this[_failed]) {
++      throw this[_outcome];
++    }
++    return this[_outcome] as T;
++  }
++
+   cancel() {
+     const status = this[_queryStatus];
+     if (status & SQLQueryStatus.cancelled) {
+@@ -229,6 +290,19 @@ class Query<T, Handle extends BaseQueryHandle<any>> extends PublicPromise<T> {
+     return this;
+   }
+ 
++  /// cancel(), for a caller that does not yield: it then blocks until the request to stop the statement has
++  /// reached the server, or for `ms` milliseconds. On PostgreSQL that request travels on a connection of its own.
++  /// Left to the event loop it goes out after whatever the caller does next, which can be what the statement was
++  /// waiting for: the statement then runs although it was cancelled.
++  cancelSync(ms?: number) {
++    const native = this[_pumped];
++    this.cancel();
++    if (native !== null) {
++      (this[_adapter] as { cancelSync?: (native: unknown, ms: number | undefined) => void }).cancelSync?.(native, ms);
++    }
++    return this;
++  }
++
+   execute() {
+     this.#run();
+     return this;
+@@ -311,6 +385,17 @@ class Query<T, Handle extends BaseQueryHandle<any>> extends PublicPromise<T> {
+   }
+ }
+ 
++/// The callbacks of onQuerySettled(), once: in their microtask, or before it from wait().
++function runSettled(this: Query<any, any>) {
++  const callbacks = this[_onSettled];
++  if (callbacks !== null) {
++    this[_onSettled] = null;
++    for (let i = 0; i < callbacks.length; i++) {
++      callbacks[i]();
++    }
++  }
++}
++
+ /// Calls `callback` in a microtask once the query has settled, before the reactions of the caller.
+ function onQuerySettled(query: Query<any, any>, callback: () => void) {
+   // A query that is only started, sql`...`.execute(), does not end the process when it fails. What the caller makes
+@@ -322,8 +407,17 @@ function onQuerySettled(query: Query<any, any>, callback: () => void) {
+     if (!$isPromisePending(query)) {
+       $resolvePromise(settled, undefined);
+     }
++    query[_onSettled] = [callback];
++    settled.$then(runSettled.bind(query));
++    return;
++  }
++  const callbacks = query[_onSettled];
++  if (callbacks !== null) {
++    callbacks.push(callback);
++  } else {
++    // They have run. As before: in a microtask of its own.
++    settled.$then(callback);
+   }
+-  settled.$then(callback);
+ }
+ 
+ Object.defineProperty(Query, Symbol.species, { value: PublicPromise });
+@@ -373,5 +467,6 @@ export default {
+     _results,
+     _waiter,
+     _copy,
++    _pumped,
+   },
+ };
+diff --git a/src/runtime/api/sql.classes.ts b/src/runtime/api/sql.classes.ts
+index 45bb5d0..a409819 100644
+--- a/src/runtime/api/sql.classes.ts
++++ b/src/runtime/api/sql.classes.ts
+@@ -28,6 +28,14 @@ const classes: ClassDefinition[] = [
+       unhold: {
+         fn: "doUnhold",
+       },
++      pump: {
++        fn: "doPump",
++        length: 1,
++      },
++      pumpCancel: {
++        fn: "doPumpCancel",
++        length: 1,
++      },
+       inTransaction: {
+         getter: "getInTransaction",
+       },
+diff --git a/src/runtime/dns_jsc/dns.rs b/src/runtime/dns_jsc/dns.rs
+index 67307f8..c72e208 100644
+--- a/src/runtime/dns_jsc/dns.rs
++++ b/src/runtime/dns_jsc/dns.rs
+@@ -3048,9 +3048,16 @@ pub(crate) mod internal {
+         #[cfg(target_os = "macos")]
+         {
+             use bun_uws::InternalLoopDataExt as _;
+-            if !env_var::feature_flag::BUN_FEATURE_FLAG_DISABLE_DNS_CACHE_LIBINFO
+-                .get()
+-                .unwrap_or(false)
++            unsafe extern "C" {
++                fn us_internal_dns_prefers_work_pool() -> core::ffi::c_int;
++            }
++            // A caller that blocks on its socket (`pump()` of a SQL connection) cannot see an
++            // answer that only a tick of the event loop reads.
++            // SAFETY: reads a thread-local.
++            if unsafe { us_internal_dns_prefers_work_pool() } == 0
++                && !env_var::feature_flag::BUN_FEATURE_FLAG_DISABLE_DNS_CACHE_LIBINFO
++                    .get()
++                    .unwrap_or(false)
+             {
+                 // SAFETY: `loop_` is the live uSockets loop; its parent tag/ptr
+                 // was set by `EventLoopHandle::set_as_parent_of` at startup.
+diff --git a/src/sql_jsc/lib.rs b/src/sql_jsc/lib.rs
+index a43e63b..6c025d4 100644
+--- a/src/sql_jsc/lib.rs
++++ b/src/sql_jsc/lib.rs
+@@ -32,6 +32,8 @@ pub mod shared {
+ 
+     pub mod datetime_text;
+ 
++    pub(crate) mod pump;
++
+     #[path = "QueryCtorArgs.rs"]
+     pub mod query_ctor_args;
+ 
+diff --git a/src/sql_jsc/mysql/JSMySQLConnection.bind.ts b/src/sql_jsc/mysql/JSMySQLConnection.bind.ts
+index 30555a2..d1d59dd 100644
+--- a/src/sql_jsc/mysql/JSMySQLConnection.bind.ts
++++ b/src/sql_jsc/mysql/JSMySQLConnection.bind.ts
+@@ -11,6 +11,7 @@ export const MySQLConnection = b.class({
+     flush: { rustName: "do_flush" },
+     hold: { rustName: "do_hold" },
+     inTransaction: { getter: b.bool },
++    pump: { rustName: "do_pump", capability: "js", args: { ms: b.f64 }, returns: b.i32 },
+     unhold: { rustName: "do_unhold", capability: "js" },
+   },
+ });
+diff --git a/src/sql_jsc/mysql/JSMySQLConnection.rs b/src/sql_jsc/mysql/JSMySQLConnection.rs
+index c534947..bc80a52 100644
+--- a/src/sql_jsc/mysql/JSMySQLConnection.rs
++++ b/src/sql_jsc/mysql/JSMySQLConnection.rs
+@@ -325,6 +325,8 @@ impl JSMySQLConnection {
+             // MySQL always opens plain TCP first; STARTTLS adopts into the TLS
+             // group after the SSLRequest exchange.
+             let group = vm.mysql_socket_group::<false>(context);
++            // So that `pump()` can see the address arrive.
++            let _resolve = crate::shared::pump::ResolveOnWorkPool::new();
+             let result = if !path.is_empty() {
+                 SocketTCP::connect_unix_group(
+                     group,
+@@ -401,6 +403,21 @@ impl JSMySQLConnection {
+         this.fail(b"Connection closed", AnyMySQLErrorT::ConnectionClosed);
+     }
+ 
++    /// `pump(ms)`: blocks the calling thread on this connection's socket alone, for at most `ms`
++    /// milliseconds, and handles what arrives. See `shared/pump.rs`.
++    pub fn do_pump(this: &Self, _: &mut JsScope<'_>, ms: f64) -> i32 {
++        let _guard = this.ref_guard();
++        // What arrives calls back into JS. The promises that settles are run by the caller's own
++        // checkpoint, not in the middle of its frame.
++        let _entered = this.entered_from_js();
++        // The loop writes what is buffered before it sleeps. It is not going to.
++        if this.can_flush() {
++            this.drain_internal();
++        }
++        let socket = this.connection.get().socket();
++        crate::shared::pump::pump(socket, crate::shared::pump::timeout_ms(ms))
++    }
++
+     pub fn do_hold(this: &Self) {
+         this.timers.set_checked_out(true);
+         this.reset_connection_timeout();
+diff --git a/src/sql_jsc/postgres/PostgresSQLConnection.rs b/src/sql_jsc/postgres/PostgresSQLConnection.rs
+index 74331e3..090f200 100644
+--- a/src/sql_jsc/postgres/PostgresSQLConnection.rs
++++ b/src/sql_jsc/postgres/PostgresSQLConnection.rs
+@@ -106,6 +106,9 @@ pub struct PostgresSQLConnection {
+     backend_key_data: Cell<Option<protocol::BackendKeyData>>,
+     /// Of a connection that only carries a CancelRequest, until it ends.
+     cancel_target: JsCell<Option<CancelTarget>>,
++    /// The connection that carries a CancelRequest for a request of this one, while it is under
++    /// way. A caller that blocks on this connection pumps that one first (`do_pump`).
++    cancelling: JsCell<Option<RefPtr<PostgresSQLConnection>>>,
+ 
+     // Self-referential — `database`/`user`/`password`/`path`/`options` are slices
+     // into `options_buf` (built by `ConnectionStrings::new`). Struct is Box-allocated
+@@ -1079,6 +1082,7 @@ fn open(
+             js_value: JsCell::new(crate::jsc::JsRef::empty()),
+             backend_key_data: Cell::new(None),
+             cancel_target: JsCell::new(params.cancel),
++            cancelling: JsCell::new(None),
+             database,
+             user: username,
+             password,
+@@ -1120,6 +1124,8 @@ fn open(
+         // so even `ssl_mode != .disable` lands in the TCP group; `setupTLS()`
+         // adopts into `postgres_tls_group` after the server's `S`.
+         let path_slice = this.path.slice();
++        // So that `pump()` can see the address arrive.
++        let _resolve = crate::shared::pump::ResolveOnWorkPool::new();
+         let result = if !path_slice.is_empty() {
+             uws::SocketTCP::connect_unix_group(
+                 group,
+@@ -1254,6 +1260,75 @@ impl PostgresSQLConnection {
+         Ok(JSValue::UNDEFINED)
+     }
+ 
++    /// `pump(ms)`: blocks the calling thread on this connection's socket alone, for at most `ms`
++    /// milliseconds, and handles what arrives. See `shared/pump.rs`.
++    pub fn do_pump(this: &Self, _: &JSGlobalObject, callframe: &CallFrame) -> JsResult<JSValue> {
++        let _guard = this.ref_guard();
++        // What arrives calls back into JS. The promises that settles are run by the caller's own
++        // checkpoint, not in the middle of its frame.
++        let _entered = this
++            .vm
++            .get()
++            .enter_event_loop_scope_without_checkpoint();
++        // The loop writes what is buffered before it sleeps. It is not going to.
++        if this.can_flush() {
++            this.drain_internal();
++        }
++        let ms = callframe.argument(0);
++        let timeout = crate::shared::pump::timeout_ms(if ms.is_number() {
++            ms.as_number()
++        } else {
++            -1.0
++        });
++        // A CancelRequest for a request of this connection travels on a connection of its own,
++        // which nothing else drives while the caller blocks. It goes first: what it is to stop
++        // would otherwise be waited for to its end.
++        let carrier = this
++            .cancelling
++            .get()
++            .as_ref()
++            .map(|carrier| *carrier.socket.get());
++        if let Some(carrier) = carrier {
++            let outcome = crate::shared::pump::pump(carrier, timeout);
++            if outcome >= 0 {
++                return Ok(JSValue::js_number_from_int32(outcome));
++            }
++        }
++        Ok(JSValue::js_number_from_int32(crate::shared::pump::pump(
++            *this.socket.get(),
++            timeout,
++        )))
++    }
++
++    /// `pumpCancel(ms)`: as `pump`, on the connection that carries a CancelRequest for a request of
++    /// this one. -1 when none is under way: the request has gone out, or there was none.
++    pub fn do_pump_cancel(
++        this: &Self,
++        _: &JSGlobalObject,
++        callframe: &CallFrame,
++    ) -> JsResult<JSValue> {
++        let _guard = this.ref_guard();
++        let _entered = this
++            .vm
++            .get()
++            .enter_event_loop_scope_without_checkpoint();
++        let ms = callframe.argument(0);
++        let timeout = crate::shared::pump::timeout_ms(if ms.is_number() {
++            ms.as_number()
++        } else {
++            -1.0
++        });
++        let carrier = this
++            .cancelling
++            .get()
++            .as_ref()
++            .map(|carrier| *carrier.socket.get());
++        Ok(JSValue::js_number_from_int32(match carrier {
++            Some(carrier) => crate::shared::pump::pump(carrier, timeout),
++            None => -1,
++        }))
++    }
++
+     pub fn do_hold(this: &Self, _: &JSGlobalObject, _: &CallFrame) -> JsResult<JSValue> {
+         this.timers.set_checked_out(true);
+         if this.status.get() == Status::Connected {
+@@ -1560,14 +1635,20 @@ impl PostgresSQLConnection {
+                 }),
+             },
+         );
+-        if dialed.is_err() {
+-            self.update_flags(|f| f.remove(ConnectionFlags::CANCEL_IN_FLIGHT));
++        match &dialed {
++            Ok(carrier) => {
++                if let Some(carrier) = js::from_js_ref(*carrier) {
++                    self.cancelling.set(Some(carrier.ref_guard()));
++                }
++            }
++            Err(_) => self.update_flags(|f| f.remove(ConnectionFlags::CANCEL_IN_FLIGHT)),
+         }
+         dialed.is_ok()
+     }
+ 
+     /// `asked`: the CancelRequest for `request` went out, and the server has dealt with it.
+     fn on_cancel_connection_closed(&self, request: &PostgresSQLQuery, asked: bool) {
++        self.cancelling.set(None);
+         self.update_flags(|f| f.remove(ConnectionFlags::CANCEL_IN_FLIGHT));
+         if self.status.get() != Status::Connected {
+             return;
+diff --git a/src/sql_jsc/shared/pump.rs b/src/sql_jsc/shared/pump.rs
+new file mode 100644
+index 0000000..a6e6e0f
+--- /dev/null
++++ b/src/sql_jsc/shared/pump.rs
+@@ -0,0 +1,66 @@
++//! Waiting for one connection's socket without the event loop (stacksjs/bun).
++//!
++//! `connection.pump(ms)` blocks the calling thread until this connection's
++//! socket has something, handles exactly that, and returns. It is what a
++//! synchronous query waits with: the loop does not turn, so no other socket,
++//! timer or task runs in the middle of the caller's statement. The C half and
++//! the reasons are at `us_socket_pump` in `packages/bun-usockets/src/loop.c`.
++
++use core::ffi::{c_int, c_void};
++
++use bun_uws as uws;
++
++unsafe extern "C" {
++    fn us_socket_pump(s: *mut c_void, timeout_ms: c_int) -> c_int;
++    fn us_connecting_socket_pump(c: *mut c_void, timeout_ms: c_int) -> c_int;
++    fn us_internal_dns_prefer_work_pool(prefer: c_int);
++}
++
++/// `ms` as `poll()` takes it. Anything that is not a finite number of at
++/// least zero is no limit.
++pub(crate) fn timeout_ms(ms: f64) -> c_int {
++    if ms.is_finite() && ms >= 0.0 {
++        ms.ceil().min(f64::from(c_int::MAX)) as c_int
++    } else {
++        -1
++    }
++}
++
++/// 1: something was handled. 0: the time passed. -1: there is nothing to
++/// wait on (the socket is closed, or is not one of the kernel's).
++pub(crate) fn pump(socket: uws::AnySocket, timeout_ms: c_int) -> c_int {
++    let internal = match socket {
++        uws::AnySocket::SocketTcp(s) => s.socket,
++        uws::AnySocket::SocketTls(s) => s.socket,
++    };
++    match internal {
++        // SAFETY: uSockets stores a live socket here until the close callback, which replaces it
++        // with `Detached` before the socket is freed (`on_close` of both drivers).
++        uws::InternalSocket::Connected(s) => unsafe { us_socket_pump(s.cast(), timeout_ms) },
++        // SAFETY: as above, until `on_open` or `on_connect_error`.
++        uws::InternalSocket::Connecting(c) => unsafe {
++            us_connecting_socket_pump(c.cast(), timeout_ms)
++        },
++        _ => -1,
++    }
++}
++
++/// While it lives, a name this thread looks up is resolved on the thread
++/// pool, whose answer `pump` can see. The answer of the system resolver that
++/// Bun otherwise asks on macOS is only read by a tick of the event loop.
++pub(crate) struct ResolveOnWorkPool(());
++
++impl ResolveOnWorkPool {
++    pub(crate) fn new() -> Self {
++        // SAFETY: counts on a thread-local.
++        unsafe { us_internal_dns_prefer_work_pool(1) };
++        Self(())
++    }
++}
++
++impl Drop for ResolveOnWorkPool {
++    fn drop(&mut self) {
++        // SAFETY: counts on a thread-local.
++        unsafe { us_internal_dns_prefer_work_pool(0) };
++    }
++}
+-- 
+2.54.0 (Apple Git-157)
+
