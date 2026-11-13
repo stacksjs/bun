@@ -1,0 +1,45 @@
+name: Track upstream
+
+# A new official Bun release should become a release here without anyone
+# asking. Every six hours: read the latest official tag, and if this
+# repository has no release built from it, start one.
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: track-upstream
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find an official release this repository has not built
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(gh api repos/oven-sh/bun/releases/latest --jq .tag_name)"
+          echo "latest official release: $tag"
+          # Ours are named <official tag>-stacks.<n>.
+          built="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName --jq '.[].tagName' | grep -c "^${tag}-stacks\." || true)"
+          # A build already under way for this tag counts: do not start a second.
+          running="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow build.yml --limit 50 --json status,displayTitle --jq "[.[] | select(.status != \"completed\") | select(.displayTitle | contains(\"$tag\"))] | length")"
+          echo "releases built from it here: $built, builds under way: $running"
+          if [ "$built" = "0" ] && [ "$running" = "0" ]; then
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Start the build
+        if: steps.find.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run build.yml --repo "$GITHUB_REPOSITORY" -f tag="${{ steps.find.outputs.tag }}" -f publish=true
