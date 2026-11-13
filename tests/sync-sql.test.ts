@@ -307,11 +307,14 @@ for (const dialect of dialects) {
       Bun.sleepSync(250)
       const name = sql.unsafe(`select name from ${table} where id = 50`).executeSync()[0].name
       // PostgreSQL stops the statement. MySQL has no request for that: there it runs when it can.
-      if (dialect.name === 'postgres')
+      if (dialect.name === 'postgres') {
         expect(name).toBe('before')
-      else
-        expect(['before', 'late']).toContain(name)
-      expect(() => blocked.executeSync(1000)).toThrow()
+        expect(() => blocked.executeSync(1000)).toThrow()
+      }
+      else {
+        expect(name).toBe('late')
+        blocked.executeSync(2000)
+      }
     })
 
     test('a statement waited for inside an awaited transaction of the same program', async () => {
