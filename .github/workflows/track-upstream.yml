@@ -21,20 +21,35 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
+      - name: Check out the patch queue
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
       - name: Find an official release this repository has not built
         id: find
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          shopt -s nullglob
+          patches=(patches/*.patch)
+          if (( ${#patches[@]} == 0 )); then
+            # Nothing of ours to add: the official binary is the same thing.
+            echo "patches/ is empty, so there is nothing to build."
+            exit 0
+          fi
           tag="$(gh api repos/oven-sh/bun/releases/latest --jq .tag_name)"
           echo "latest official release: $tag"
           # Ours are named <official tag>-stacks.<n>.
           built="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName --jq '.[].tagName' | grep -c "^${tag}-stacks\." || true)"
-          # A build already under way for this tag counts: do not start a second.
-          running="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow build.yml --limit 50 --json status,displayTitle --jq "[.[] | select(.status != \"completed\") | select(.displayTitle | contains(\"$tag\"))] | length")"
-          echo "releases built from it here: $built, builds under way: $running"
-          if [ "$built" = "0" ] && [ "$running" = "0" ]; then
+          # One attempt per official tag per state of the patch queue. A build
+          # that failed (a patch that no longer applies, a runner out of
+          # memory) is not retried every six hours: it is retried when the
+          # queue changes, or by hand.
+          tried="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow build.yml --limit 100 --json headSha,displayTitle --jq "[.[] | select(.headSha == \"$GITHUB_SHA\") | select(.displayTitle | contains(\"$tag\"))] | length")"
+          echo "releases built from it here: $built, builds of it at this commit: $tried"
+          if [ "$built" = "0" ] && [ "$tried" = "0" ]; then
             echo "tag=$tag" >> "$GITHUB_OUTPUT"
           fi
 

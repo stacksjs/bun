@@ -24,7 +24,7 @@ A release is named after the official one it is built from, with our revision: `
 
 ## When a patch stops applying
 
-`track-upstream` builds whatever `patches/` is at the time. If a patch no longer applies to a new official release, the build fails at the `git am` step and no release is made: the previous release stays the latest. Refresh the patch against the new tag, commit it here, and run `build.yml` for that tag.
+`track-upstream` builds whatever `patches/` is at the time, once per official release per state of the queue. If a patch no longer applies to a new official release, the build fails at the `git am` step and no release is made: the previous release stays the latest. Refresh the patch against the new tag and commit it here; the next check builds it, or run `build.yml` for that tag by hand. While `patches/` is empty the tracker starts nothing.
 
 ## Adding a patch
 
