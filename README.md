@@ -51,7 +51,24 @@ Two things the event loop would otherwise do are done by the waiting call: a dia
 
 ## Status
 
-STATUS_PLACEHOLDER
+**Nothing has been released from this repository yet.** The patch is written and is being built and tested; until a release appears under Releases, there is no binary of it to download.
+
+What is proven so far: the release build runs on GitHub's hosted runners. [Run 43340878329](https://github.com/stacksjs/bun/actions/runs/43340878329) built `bun-v1.4.4` unmodified, without cross-language LTO:
+
+| Target | Runner | Wall time | `bun --revision` |
+|---|---|---|---|
+| `linux-x64` | `ubuntu-latest` (4 vCPU, 16 GB) | 19 minutes | `1.4.4+38afee6c8` |
+| `darwin-aarch64` | `macos-15` | 27 minutes | `1.4.4+38afee6c8` |
+
+A release is only made from a build whose binaries pass `tests/` against a real PostgreSQL and a real MySQL, on both runners (the `test` job of `build.yml`).
+
+What is not done:
+
+- **The Linux binary needs glibc 2.43**, the runner's. Upstream links against a glibc 2.31 sysroot so its binary runs on older distributions; that sysroot is not provisioned here yet (the recipe is in upstream's `scripts/build/ci-images/spec.ts`, see BUILDING.md).
+- **Two targets of upstream's eighteen.** No `linux-aarch64`, musl, Windows, FreeBSD or Android builds, and no `-profile` zips. On Windows the calls answer that there is nothing to wait on.
+- **No cross-language LTO**, which upstream ships with. It needs far more memory at link than a hosted runner has.
+- **TLS connections are not covered by the tests.** The code path is the event loop's own, but no test server here speaks TLS.
+- **No type declarations.** `bun-types` does not know the three calls.
 
 ## Releases
 
