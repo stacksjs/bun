@@ -33,6 +33,7 @@ tx.release()
 |---|---|
 | `query.executeSync(ms?)` | Runs the statement and returns its result, or throws what it failed with. After `ms` milliseconds without an answer it throws `ERR_POSTGRES_SYNC_TIMEOUT` / `ERR_MYSQL_SYNC_TIMEOUT`; the statement keeps running and can still be awaited or cancelled. |
 | `query.wait(ms?)` | Starts the statement and blocks until it has settled. `true`: settled. `false`: `ms` passed. `null`: nothing this thread can wait on, so only the event loop can settle it. |
+| `query.cancelSync(ms?)` | `cancel()`, then blocks until the request to stop the statement has reached the server. PostgreSQL sends that request on a connection of its own; left to the event loop it would go out after whatever the caller does next. |
 | `sql.reserveSync(ms?)` | `sql.reserve()` where it is called. `undefined` when no connection can be had without the event loop turning. |
 
 Everything else is Bun's own API, unchanged, and a statement that is awaited behaves as before. The two can be mixed.

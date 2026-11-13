@@ -287,6 +287,33 @@ for (const dialect of dialects) {
       }
     })
 
+    test('a statement that is given up on is stopped before the caller goes on', () => {
+      sql.unsafe(`delete from ${table}`).executeSync()
+      sql.unsafe(`insert into ${table} (id, name) values (50, 'before')`).executeSync()
+      const holder = sql.reserveSync()!
+      holder.unsafe('BEGIN').executeSync()
+      holder.unsafe(`update ${table} set name = 'held' where id = 50`).executeSync()
+
+      // Waits for the row the holder has.
+      const blocked = sql.unsafe(`update ${table} set name = 'late' where id = 50`)
+      expect(blocked.wait(150)).toBe(false)
+      const started = performance.now()
+      blocked.cancelSync(3000)
+      expect(performance.now() - started).toBeLessThan(2500)
+
+      // What it waited for, without the event loop having turned since the cancel.
+      holder.unsafe('ROLLBACK').executeSync()
+      holder.release()
+      Bun.sleepSync(250)
+      const name = sql.unsafe(`select name from ${table} where id = 50`).executeSync()[0].name
+      // PostgreSQL stops the statement. MySQL has no request for that: there it runs when it can.
+      if (dialect.name === 'postgres')
+        expect(name).toBe('before')
+      else
+        expect(['before', 'late']).toContain(name)
+      expect(() => blocked.executeSync(1000)).toThrow()
+    })
+
     test('a statement waited for inside an awaited transaction of the same program', async () => {
       const result = await sql.begin(async (tx: any) => {
         await tx.unsafe('select 1')

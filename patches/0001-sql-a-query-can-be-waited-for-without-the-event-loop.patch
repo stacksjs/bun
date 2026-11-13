@@ -15,18 +15,18 @@ else of the program runs in the middle of the caller's statement.
   whose answer the pump can see without a tick.
 ---
  packages/bun-usockets/src/crypto/openssl.c    |  41 +++
- packages/bun-usockets/src/loop.c              | 245 ++++++++++++++++++
+ packages/bun-usockets/src/loop.c              | 245 +++++++++++++++++
  src/js/bun/sql.ts                             |  51 +++-
- src/js/internal/sql/pool.ts                   | 234 +++++++++++++++--
- src/js/internal/sql/query.ts                  |  84 +++++-
- src/runtime/api/sql.classes.ts                |   4 +
+ src/js/internal/sql/pool.ts                   | 250 ++++++++++++++++--
+ src/js/internal/sql/query.ts                  |  97 ++++++-
+ src/runtime/api/sql.classes.ts                |   8 +
  src/runtime/dns_jsc/dns.rs                    |  13 +-
  src/sql_jsc/lib.rs                            |   2 +
  src/sql_jsc/mysql/JSMySQLConnection.bind.ts   |   1 +
  src/sql_jsc/mysql/JSMySQLConnection.rs        |  17 ++
- src/sql_jsc/postgres/PostgresSQLConnection.rs |  28 ++
+ src/sql_jsc/postgres/PostgresSQLConnection.rs |  85 +++++-
  src/sql_jsc/shared/pump.rs                    |  66 +++++
- 12 files changed, 753 insertions(+), 33 deletions(-)
+ 12 files changed, 841 insertions(+), 35 deletions(-)
  create mode 100644 src/sql_jsc/shared/pump.rs
 
 diff --git a/packages/bun-usockets/src/crypto/openssl.c b/packages/bun-usockets/src/crypto/openssl.c
@@ -432,7 +432,7 @@ index b331c4e..9103ad7 100644
    "array",
    "json",
 diff --git a/src/js/internal/sql/pool.ts b/src/js/internal/sql/pool.ts
-index ca54dbb..56ff4f9 100644
+index ca54dbb..cb1cce5 100644
 --- a/src/js/internal/sql/pool.ts
 +++ b/src/js/internal/sql/pool.ts
 @@ -7,7 +7,7 @@ type SQLResultArray<T> = import("./shared").SQLResultArray<T>;
@@ -647,7 +647,7 @@ index ca54dbb..56ff4f9 100644
  }
  
  /// A result of several: CALL <proc>() and a text of several statements.
-@@ -894,6 +950,128 @@ abstract class BaseSQLAdapter<ConnectionHandle extends NativeConnection, QueryHa
+@@ -894,6 +950,144 @@ abstract class BaseSQLAdapter<ConnectionHandle extends NativeConnection, QueryHa
      }
    }
  
@@ -768,6 +768,22 @@ index ca54dbb..56ff4f9 100644
 +    );
 +  }
 +
++  /// For Query.cancelSync(): blocks until the request to stop a statement on `native` has reached the server, for
++  /// at most `ms` milliseconds. PostgreSQL sends it on a connection of its own, which nothing else drives while
++  /// the caller does not yield. MySQL has no such request.
++  cancelSync(native: ConnectionHandle & { pumpCancel?: (ms: number) => number }, ms: number | undefined) {
++    if (!native.pumpCancel) {
++      return;
++    }
++    const deadline = (ms as number) >= 0 ? monotonicNowMs() + (ms as number) : Infinity;
++    for (;;) {
++      const left = deadline - monotonicNowMs();
++      if (left <= 0 || native.pumpCancel(left === Infinity ? -1 : Math.min(left, 2 ** 31 - 1)) < 0) {
++        return;
++      }
++    }
++  }
++
 +  /// For reserveSync(): a caller is in the queue, and waits for a dial.
 +  connectSync(done: () => boolean, ms: number | undefined): boolean | null {
 +    return this.#block(done, () => null, ms);
@@ -777,7 +793,7 @@ index ca54dbb..56ff4f9 100644
      const connections = this.connections;
      for (let i = 0; i < connections.length; i++) {
 diff --git a/src/js/internal/sql/query.ts b/src/js/internal/sql/query.ts
-index 067838a..27b6a92 100644
+index 067838a..ebe3b82 100644
 --- a/src/js/internal/sql/query.ts
 +++ b/src/js/internal/sql/query.ts
 @@ -13,6 +13,10 @@ const _adapter = Symbol("adapter");
@@ -880,7 +896,27 @@ index 067838a..27b6a92 100644
    cancel() {
      const status = this[_queryStatus];
      if (status & SQLQueryStatus.cancelled) {
-@@ -311,6 +372,17 @@ class Query<T, Handle extends BaseQueryHandle<any>> extends PublicPromise<T> {
+@@ -229,6 +290,19 @@ class Query<T, Handle extends BaseQueryHandle<any>> extends PublicPromise<T> {
+     return this;
+   }
+ 
++  /// cancel(), for a caller that does not yield: it then blocks until the request to stop the statement has
++  /// reached the server, or for `ms` milliseconds. On PostgreSQL that request travels on a connection of its own.
++  /// Left to the event loop it goes out after whatever the caller does next, which can be what the statement was
++  /// waiting for: the statement then runs although it was cancelled.
++  cancelSync(ms?: number) {
++    const native = this[_pumped];
++    this.cancel();
++    if (native !== null) {
++      (this[_adapter] as { cancelSync?: (native: unknown, ms: number | undefined) => void }).cancelSync?.(native, ms);
++    }
++    return this;
++  }
++
+   execute() {
+     this.#run();
+     return this;
+@@ -311,6 +385,17 @@ class Query<T, Handle extends BaseQueryHandle<any>> extends PublicPromise<T> {
    }
  }
  
@@ -898,7 +934,7 @@ index 067838a..27b6a92 100644
  /// Calls `callback` in a microtask once the query has settled, before the reactions of the caller.
  function onQuerySettled(query: Query<any, any>, callback: () => void) {
    // A query that is only started, sql`...`.execute(), does not end the process when it fails. What the caller makes
-@@ -322,8 +394,17 @@ function onQuerySettled(query: Query<any, any>, callback: () => void) {
+@@ -322,8 +407,17 @@ function onQuerySettled(query: Query<any, any>, callback: () => void) {
      if (!$isPromisePending(query)) {
        $resolvePromise(settled, undefined);
      }
@@ -917,7 +953,7 @@ index 067838a..27b6a92 100644
  }
  
  Object.defineProperty(Query, Symbol.species, { value: PublicPromise });
-@@ -373,5 +454,6 @@ export default {
+@@ -373,5 +467,6 @@ export default {
      _results,
      _waiter,
      _copy,
@@ -925,15 +961,19 @@ index 067838a..27b6a92 100644
    },
  };
 diff --git a/src/runtime/api/sql.classes.ts b/src/runtime/api/sql.classes.ts
-index 45bb5d0..47e9cfe 100644
+index 45bb5d0..a409819 100644
 --- a/src/runtime/api/sql.classes.ts
 +++ b/src/runtime/api/sql.classes.ts
-@@ -28,6 +28,10 @@ const classes: ClassDefinition[] = [
+@@ -28,6 +28,14 @@ const classes: ClassDefinition[] = [
        unhold: {
          fn: "doUnhold",
        },
 +      pump: {
 +        fn: "doPump",
++        length: 1,
++      },
++      pumpCancel: {
++        fn: "doPumpCancel",
 +        length: 1,
 +      },
        inTransaction: {
@@ -1024,10 +1064,28 @@ index c534947..bc80a52 100644
          this.timers.set_checked_out(true);
          this.reset_connection_timeout();
 diff --git a/src/sql_jsc/postgres/PostgresSQLConnection.rs b/src/sql_jsc/postgres/PostgresSQLConnection.rs
-index 74331e3..73ef334 100644
+index 74331e3..090f200 100644
 --- a/src/sql_jsc/postgres/PostgresSQLConnection.rs
 +++ b/src/sql_jsc/postgres/PostgresSQLConnection.rs
-@@ -1120,6 +1120,8 @@ fn open(
+@@ -106,6 +106,9 @@ pub struct PostgresSQLConnection {
+     backend_key_data: Cell<Option<protocol::BackendKeyData>>,
+     /// Of a connection that only carries a CancelRequest, until it ends.
+     cancel_target: JsCell<Option<CancelTarget>>,
++    /// The connection that carries a CancelRequest for a request of this one, while it is under
++    /// way. A caller that blocks on this connection pumps that one first (`do_pump`).
++    cancelling: JsCell<Option<RefPtr<PostgresSQLConnection>>>,
+ 
+     // Self-referential — `database`/`user`/`password`/`path`/`options` are slices
+     // into `options_buf` (built by `ConnectionStrings::new`). Struct is Box-allocated
+@@ -1079,6 +1082,7 @@ fn open(
+             js_value: JsCell::new(crate::jsc::JsRef::empty()),
+             backend_key_data: Cell::new(None),
+             cancel_target: JsCell::new(params.cancel),
++            cancelling: JsCell::new(None),
+             database,
+             user: username,
+             password,
+@@ -1120,6 +1124,8 @@ fn open(
          // so even `ssl_mode != .disable` lands in the TCP group; `setupTLS()`
          // adopts into `postgres_tls_group` after the server's `S`.
          let path_slice = this.path.slice();
@@ -1036,7 +1094,7 @@ index 74331e3..73ef334 100644
          let result = if !path_slice.is_empty() {
              uws::SocketTCP::connect_unix_group(
                  group,
-@@ -1254,6 +1256,32 @@ impl PostgresSQLConnection {
+@@ -1254,6 +1260,75 @@ impl PostgresSQLConnection {
          Ok(JSValue::UNDEFINED)
      }
  
@@ -1060,15 +1118,81 @@ index 74331e3..73ef334 100644
 +        } else {
 +            -1.0
 +        });
++        // A CancelRequest for a request of this connection travels on a connection of its own,
++        // which nothing else drives while the caller blocks. It goes first: what it is to stop
++        // would otherwise be waited for to its end.
++        let carrier = this
++            .cancelling
++            .get()
++            .as_ref()
++            .map(|carrier| *carrier.socket.get());
++        if let Some(carrier) = carrier {
++            let outcome = crate::shared::pump::pump(carrier, timeout);
++            if outcome >= 0 {
++                return Ok(JSValue::js_number_from_int32(outcome));
++            }
++        }
 +        Ok(JSValue::js_number_from_int32(crate::shared::pump::pump(
 +            *this.socket.get(),
 +            timeout,
 +        )))
 +    }
 +
++    /// `pumpCancel(ms)`: as `pump`, on the connection that carries a CancelRequest for a request of
++    /// this one. -1 when none is under way: the request has gone out, or there was none.
++    pub fn do_pump_cancel(
++        this: &Self,
++        _: &JSGlobalObject,
++        callframe: &CallFrame,
++    ) -> JsResult<JSValue> {
++        let _guard = this.ref_guard();
++        let _entered = this
++            .vm
++            .get()
++            .enter_event_loop_scope_without_checkpoint();
++        let ms = callframe.argument(0);
++        let timeout = crate::shared::pump::timeout_ms(if ms.is_number() {
++            ms.as_number()
++        } else {
++            -1.0
++        });
++        let carrier = this
++            .cancelling
++            .get()
++            .as_ref()
++            .map(|carrier| *carrier.socket.get());
++        Ok(JSValue::js_number_from_int32(match carrier {
++            Some(carrier) => crate::shared::pump::pump(carrier, timeout),
++            None => -1,
++        }))
++    }
++
      pub fn do_hold(this: &Self, _: &JSGlobalObject, _: &CallFrame) -> JsResult<JSValue> {
          this.timers.set_checked_out(true);
          if this.status.get() == Status::Connected {
+@@ -1560,14 +1635,20 @@ impl PostgresSQLConnection {
+                 }),
+             },
+         );
+-        if dialed.is_err() {
+-            self.update_flags(|f| f.remove(ConnectionFlags::CANCEL_IN_FLIGHT));
++        match &dialed {
++            Ok(carrier) => {
++                if let Some(carrier) = js::from_js_ref(*carrier) {
++                    self.cancelling.set(Some(carrier.ref_guard()));
++                }
++            }
++            Err(_) => self.update_flags(|f| f.remove(ConnectionFlags::CANCEL_IN_FLIGHT)),
+         }
+         dialed.is_ok()
+     }
+ 
+     /// `asked`: the CancelRequest for `request` went out, and the server has dealt with it.
+     fn on_cancel_connection_closed(&self, request: &PostgresSQLQuery, asked: bool) {
++        self.cancelling.set(None);
+         self.update_flags(|f| f.remove(ConnectionFlags::CANCEL_IN_FLIGHT));
+         if self.status.get() != Status::Connected {
+             return;
 diff --git a/src/sql_jsc/shared/pump.rs b/src/sql_jsc/shared/pump.rs
 new file mode 100644
 index 0000000..a6e6e0f
