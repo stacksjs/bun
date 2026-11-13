@@ -10,30 +10,48 @@ This branch holds no Bun source. It holds what turns an official Bun release int
 
 So a release here is always "that official tag, plus these patches", and it can be reproduced from the two.
 
+## What the patches add
+
+Synchronous queries on Bun's MySQL and Postgres drivers. `bun:sqlite` runs a query where it is called; `Bun.sql` answers with a promise. With the patches a statement can be waited for where it is issued:
+
+```ts
+import { SQL } from 'bun'
+
+const sql = new SQL('postgres://localhost/app')
+
+const users = sql`select * from users where id = ${id}`.executeSync() // the rows, or a throw
+const orders = sql.unsafe('select * from orders where user_id = $1', [id]).executeSync(5000)
+
+const tx = sql.reserveSync() // a connection of the caller's own
+tx.unsafe('BEGIN').executeSync()
+tx.unsafe('update accounts set balance = balance - 10 where id = 1').executeSync()
+tx.unsafe('COMMIT').executeSync()
+tx.release()
+```
+
+| Call | What it does |
+|---|---|
+| `query.executeSync(ms?)` | Runs the statement and returns its result, or throws what it failed with. After `ms` milliseconds without an answer it throws `ERR_POSTGRES_SYNC_TIMEOUT` / `ERR_MYSQL_SYNC_TIMEOUT`; the statement keeps running and can still be awaited or cancelled. |
+| `query.wait(ms?)` | Starts the statement and blocks until it has settled. `true`: settled. `false`: `ms` passed. `null`: nothing this thread can wait on, so only the event loop can settle it. |
+| `sql.reserveSync(ms?)` | `sql.reserve()` where it is called. `undefined` when no connection can be had without the event loop turning. |
+
+Everything else is Bun's own API, unchanged, and a statement that is awaited behaves as before. The two can be mixed.
+
+### How it waits
+
+The calling thread blocks on the socket of the one connection that has the answer, and what arrives on that socket is handled exactly as a tick of the event loop would handle it, TLS and connecting included. The event loop itself does not turn. So while a statement is waited for, nothing else of the program runs: no other socket, no timer, no microtask. That is what `bun:sqlite` has always done, and it is the point: a nested tick would run other requests in the middle of the caller's statement.
+
+It follows that a statement cannot be waited for when what it needs can only come from the event loop: a connection that code which `await`s is holding, or a password that is a promise. `wait()` says so with `null` instead of blocking for nothing.
+
+Two things the event loop would otherwise do are done by the waiting call: a dial that failed because the server was still starting is tried again after its pause, and once a second the idle connections are read, so one that the server closed while the program did not yield leaves the pool before a statement is put on it.
+
+### Who uses it
+
+[bun-query-builder](https://github.com/stacksjs/bun-query-builder), and through it Stacks' models and `db`: `const user = User.where(...).first()` is the row on SQLite, MySQL and Postgres. On stock Bun it gets there by keeping the connection on a worker thread and blocking the caller on it. On this Bun it uses the calls above on the calling thread: no second thread, and no copy of the rows between two. It looks at the runtime and picks; nothing in Stacks requires this fork.
+
 ## Status
 
-**Nothing has been released from this repository yet.** `patches/` is empty, so a build today is an unmodified Bun, and the tracker starts nothing while it is.
-
-What is proven: the release build runs on GitHub's hosted runners. [Run 43340878329](https://github.com/stacksjs/bun/actions/runs/43340878329) built `bun-v1.4.4` unmodified, without cross-language LTO:
-
-| Target | Runner | Wall time | `bun --revision` |
-|---|---|---|---|
-| `linux-x64` | `ubuntu-latest` (4 vCPU, 16 GB) | 19 minutes | `1.4.4+38afee6c8` |
-| `darwin-aarch64` | `macos-15` | 27 minutes | `1.4.4+38afee6c8` |
-
-That is the official revision. The macOS binary was downloaded and run: `bun:sqlite`, `Bun.sql` against Postgres and `node:worker_threads` all answer.
-
-What is not done:
-
-- **No patch exists yet.** The synchronous MySQL and Postgres calls below are the reason for this fork and have not been written.
-- **The Linux binary needs glibc 2.43**, the runner's. Upstream links against a glibc 2.31 sysroot so its binary runs on older distributions; that sysroot is not provisioned here yet (the recipe is in upstream's `scripts/build/ci-images/spec.ts`, see BUILDING.md).
-- **Two targets of upstream's eighteen.** No `linux-aarch64`, musl, Windows, FreeBSD or Android builds, and no `-profile` zips.
-- **No cross-language LTO**, which upstream ships with. It needs far more memory at link than a hosted runner has.
-- **The release job has never run.** It is skipped while `patches/` is empty.
-
-## What the patches are for
-
-Synchronous queries on Bun's MySQL and Postgres drivers. `bun:sqlite` runs a query where it is called; `Bun.sql` answers with a promise. Stacks' model layer returns values in place on all three (`const user = User.where(...).first()`), and for the network drivers it currently does that by holding the connection on a worker thread ([bun-query-builder](https://github.com/stacksjs/bun-query-builder), `src/sync-driver.ts`). A native synchronous call would remove the second thread and the copy between them. Nothing in Stacks depends on this fork: the worker path stays as the default for stock Bun.
+STATUS_PLACEHOLDER
 
 ## Releases
 

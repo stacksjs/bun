@@ -1,7 +1,8 @@
 // What the patches add to Bun's MySQL and Postgres drivers, run by the binary
 // that was just built: `bun test tests/` with POSTGRES_URL and MYSQL_URL set.
 //
-//   query.wait(ms)         block until the query has settled; whether it has
+//   query.wait(ms)         block until the query has settled: true, false when
+//                          `ms` passed, null when only the event loop can settle it
 //   query.executeSync(ms)  the rows, or a throw, where it is called
 //   sql.reserveSync(ms)    a connection of the caller's own, where it is called
 //
@@ -18,6 +19,10 @@ interface Dialect {
   sleep: (seconds: number) => string
   /** `count` rows of about a kilobyte each. */
   wide: (count: number) => string
+  /** The server's id for the connection that asks, as `id`. */
+  connectionId: string
+  /** Closes the connection with that id. */
+  kill: (id: number) => string
   syncTimeout: string
 }
 
@@ -27,6 +32,8 @@ const dialects: Dialect[] = [
     url: process.env.POSTGRES_URL,
     sleep: seconds => `select pg_sleep(${seconds})`,
     wide: count => `select n, repeat('x', 1000) as pad from generate_series(1, ${count}) as s(n)`,
+    connectionId: 'select pg_backend_pid() as id',
+    kill: id => `select pg_terminate_backend(${id})`,
     syncTimeout: 'ERR_POSTGRES_SYNC_TIMEOUT',
   },
   {
@@ -34,6 +41,8 @@ const dialects: Dialect[] = [
     url: process.env.MYSQL_URL,
     sleep: seconds => `select sleep(${seconds})`,
     wide: count => `with recursive s(n) as (select 1 union all select n + 1 from s where n < ${count}) select n, repeat('x', 1000) as pad from s`,
+    connectionId: 'select connection_id() as id',
+    kill: id => `kill ${id}`,
     syncTimeout: 'ERR_MYSQL_SYNC_TIMEOUT',
   },
 ]
@@ -221,7 +230,8 @@ for (const dialect of dialects) {
       const started = performance.now()
       expect(single.reserveSync(2000)).toBeUndefined()
       const queued = single.unsafe('select 5 as n')
-      expect(queued.wait(2000)).toBe(false)
+      // Not false: no amount of waiting on this thread would help.
+      expect(queued.wait(2000)).toBe(null)
       expect(performance.now() - started).toBeLessThan(1000)
       holder.release()
       expect(Number((await queued)[0].n)).toBe(5)
@@ -229,6 +239,19 @@ for (const dialect of dialects) {
       const again = single.reserveSync()
       expect(again).toBeDefined()
       again!.release()
+    })
+
+    test('a connection the server closed while the program did not yield is not the one a statement gets', () => {
+      const single = client(url, { max: 1 })
+      const id = Number(single.unsafe(dialect.connectionId).executeSync()[0].id)
+      expect(id).toBeGreaterThan(0)
+      // Closed from another connection. The pool of `single` only learns of it when it reads its socket.
+      sql.unsafe(dialect.kill(id)).executeSync()
+      Bun.sleepSync(1200)
+      // Without the event loop having turned: the statement leaves the dead connection where it finds it.
+      const after = Number(single.unsafe(dialect.connectionId).executeSync()[0].id)
+      expect(after).toBeGreaterThan(0)
+      expect(after).not.toBe(id)
     })
 
     test('a statement waited for inside an awaited transaction of the same program', async () => {
