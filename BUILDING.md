@@ -1,9 +1,19 @@
 # Building Bun `bun-v1.4.4` on GitHub-hosted runners: findings
 
+> **Result, added after the first run.** The notes below were written before the
+> workflow had ever run, from reading upstream's build system, and they keep
+> their estimates as written. Run
+> [43340878329](https://github.com/stacksjs/bun/actions/runs/43340878329) then
+> built both targets with `lto: false`: `linux-x64` in 19 minutes and
+> `darwin-aarch64` in 27, each reporting `1.4.4+38afee6c8`. So the estimates at
+> the end ("roughly even odds" for Linux, "unlikely" for macOS) were too
+> pessimistic, and every guessed step listed under "Guessed rather than read"
+> worked as written. Still unmeasured: `lto: true`, and anything about memory
+> headroom (the diagnostics artifacts of that run have the samples).
+
 Everything below was read from files at the tag over
 `https://raw.githubusercontent.com/oven-sh/bun/bun-v1.4.4/<path>`. Nothing was
-cloned, built or run. Line numbers are of the file at that tag. `build.yml` in
-this directory has never been executed.
+cloned, built or run. Line numbers are of the file at that tag. `build.yml` had never been executed when this was written.
 
 ## Corrections to the starting assumptions
 

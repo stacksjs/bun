@@ -12,7 +12,24 @@ So a release here is always "that official tag, plus these patches", and it can 
 
 ## Status
 
-**Nothing has been released from this repository yet.** `patches/` is empty, so a build today is an unmodified Bun. The first goal is narrower: prove the release build runs on the runners this repository has. Upstream builds on machines with 16 vCPU and 128 GB of memory; GitHub's hosted runners have 4 vCPU and 16 GB.
+**Nothing has been released from this repository yet.** `patches/` is empty, so a build today is an unmodified Bun, and the tracker starts nothing while it is.
+
+What is proven: the release build runs on GitHub's hosted runners. [Run 43340878329](https://github.com/stacksjs/bun/actions/runs/43340878329) built `bun-v1.4.4` unmodified, without cross-language LTO:
+
+| Target | Runner | Wall time | `bun --revision` |
+|---|---|---|---|
+| `linux-x64` | `ubuntu-latest` (4 vCPU, 16 GB) | 19 minutes | `1.4.4+38afee6c8` |
+| `darwin-aarch64` | `macos-15` | 27 minutes | `1.4.4+38afee6c8` |
+
+That is the official revision. The macOS binary was downloaded and run: `bun:sqlite`, `Bun.sql` against Postgres and `node:worker_threads` all answer.
+
+What is not done:
+
+- **No patch exists yet.** The synchronous MySQL and Postgres calls below are the reason for this fork and have not been written.
+- **The Linux binary needs glibc 2.43**, the runner's. Upstream links against a glibc 2.31 sysroot so its binary runs on older distributions; that sysroot is not provisioned here yet (the recipe is in upstream's `scripts/build/ci-images/spec.ts`, see BUILDING.md).
+- **Two targets of upstream's eighteen.** No `linux-aarch64`, musl, Windows, FreeBSD or Android builds, and no `-profile` zips.
+- **No cross-language LTO**, which upstream ships with. It needs far more memory at link than a hosted runner has.
+- **The release job has never run.** It is skipped while `patches/` is empty.
 
 ## What the patches are for
 
