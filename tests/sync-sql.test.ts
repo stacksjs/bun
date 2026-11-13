@@ -218,7 +218,15 @@ for (const dialect of dialects) {
       parsed.port = '1'
       const nowhere = client(parsed.toString(), { max: 1, connectionTimeout: 5 })
       const started = performance.now()
-      expect(() => nowhere.unsafe('select 1').executeSync(10_000)).toThrow()
+      let code: unknown
+      try {
+        nowhere.unsafe('select 1').executeSync(10_000)
+      }
+      catch (error) {
+        code = (error as { code?: unknown }).code
+      }
+      // What the dial failed with, not that the wait ran out.
+      expect(String(code)).toMatch(/CONNECTION/)
       expect(performance.now() - started).toBeLessThan(8000)
     })
 

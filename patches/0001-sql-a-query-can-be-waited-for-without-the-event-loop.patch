@@ -14,9 +14,9 @@ else of the program runs in the middle of the caller's statement.
 - A name looked up for a SQL connection is resolved on the thread pool,
   whose answer the pump can see without a tick.
 ---
- packages/bun-usockets/src/loop.c              | 208 ++++++++++++++++++
- src/js/bun/sql.ts                             |  51 ++++-
- src/js/internal/sql/pool.ts                   | 143 +++++++++++-
+ packages/bun-usockets/src/loop.c              | 208 ++++++++++++++++
+ src/js/bun/sql.ts                             |  51 +++-
+ src/js/internal/sql/pool.ts                   | 234 +++++++++++++++---
  src/js/internal/sql/query.ts                  |  84 ++++++-
  src/runtime/api/sql.classes.ts                |   4 +
  src/runtime/dns_jsc/dns.rs                    |  13 +-
@@ -24,8 +24,8 @@ else of the program runs in the middle of the caller's statement.
  src/sql_jsc/mysql/JSMySQLConnection.bind.ts   |   1 +
  src/sql_jsc/mysql/JSMySQLConnection.rs        |  17 ++
  src/sql_jsc/postgres/PostgresSQLConnection.rs |  28 +++
- src/sql_jsc/shared/pump.rs                    |  66 ++++++
- 11 files changed, 606 insertions(+), 11 deletions(-)
+ src/sql_jsc/shared/pump.rs                    |  66 +++++
+ 11 files changed, 675 insertions(+), 33 deletions(-)
  create mode 100644 src/sql_jsc/shared/pump.rs
 
 diff --git a/packages/bun-usockets/src/loop.c b/packages/bun-usockets/src/loop.c
@@ -342,7 +342,7 @@ index b331c4e..9103ad7 100644
    "array",
    "json",
 diff --git a/src/js/internal/sql/pool.ts b/src/js/internal/sql/pool.ts
-index ca54dbb..4714b35 100644
+index ca54dbb..56ff4f9 100644
 --- a/src/js/internal/sql/pool.ts
 +++ b/src/js/internal/sql/pool.ts
 @@ -7,7 +7,7 @@ type SQLResultArray<T> = import("./shared").SQLResultArray<T>;
@@ -364,7 +364,18 @@ index ca54dbb..4714b35 100644
  }
  
  /// A driver ignores the trailing arguments it does not take.
-@@ -88,6 +91,8 @@ class Reservation {
+@@ -76,6 +79,10 @@ export type NativeCreateQuery<QueryHandle> = (
+ 
+ type OnConnected = (err: Error | null, connection: any) => void;
+ 
++/// What a native dial threw where it was started, once a caller that blocks has dealt with it: the catch in
++/// PooledConnection#dial() is a microtask behind, and must not deal with it again.
++const handledDialErrors = new WeakSet<object>();
++
+ /// In the pool's queue: a caller that wants a connection for itself. A query is queued as its bare callback.
+ class Reservation {
+   onConnected: OnConnected;
+@@ -88,6 +95,8 @@ class Reservation {
  class PooledConnection<ConnectionHandle extends NativeConnection = any> {
    adapter: BaseSQLAdapter<ConnectionHandle, any>;
    connection: ConnectionHandle | null = null;
@@ -373,17 +384,19 @@ index ca54dbb..4714b35 100644
    state: PooledConnectionState = PooledConnectionState.connecting;
    closeHandlers: Set<(err: Error) => void> = new Set();
    flags: number = 0;
-@@ -96,6 +101,9 @@ class PooledConnection<ConnectionHandle extends NativeConnection = any> {
+@@ -96,6 +105,11 @@ class PooledConnection<ConnectionHandle extends NativeConnection = any> {
    connectStartedAt: number = monotonicNowMs();
    connectAttempts: number = 0;
    retryTimer: ReturnType<typeof setTimeout> | null = null;
++  /// What the native dial threw where it was started (nothing listens on a local port, say).
++  dialFailure: unknown = null;
 +  /// When `retryTimer` fires, and what the dial that it follows failed with.
 +  retryAt: number = 0;
 +  retryError: Error | null = null;
    saslprep: boolean;
    otherPassword: boolean | undefined;
    #releaseQuery: () => void;
-@@ -108,7 +116,7 @@ class PooledConnection<ConnectionHandle extends NativeConnection = any> {
+@@ -108,7 +122,7 @@ class PooledConnection<ConnectionHandle extends NativeConnection = any> {
  
    async #startConnection() {
      const adapter = this.adapter;
@@ -392,7 +405,7 @@ index ca54dbb..4714b35 100644
        adapter.createNativeConnection,
        adapter.connectionInfo,
        adapter.ownerCallback(this.#handleConnected.bind(this)),
-@@ -116,6 +124,11 @@ class PooledConnection<ConnectionHandle extends NativeConnection = any> {
+@@ -116,6 +130,11 @@ class PooledConnection<ConnectionHandle extends NativeConnection = any> {
        adapter.ownerCallback(this.#handleRetire.bind(this)),
        this,
      );
@@ -404,7 +417,19 @@ index ca54dbb..4714b35 100644
    }
  
    /// Connect failures (ERR_*_CONNECTION_FAILED) mean the server accepted the TCP connection but closed it before
-@@ -148,6 +161,7 @@ class PooledConnection<ConnectionHandle extends NativeConnection = any> {
+@@ -135,7 +154,10 @@ class PooledConnection<ConnectionHandle extends NativeConnection = any> {
+       await this.adapter.runAsOwner(this.#startConnection, this);
+     } catch (err) {
+       // nothing was dialed: the password function threw, or an option is refused
+-      this.#handleClose(err as Error);
++      this.dialFailure = null;
++      if (!($isObject(err) && handledDialErrors.has(err))) {
++        this.#handleClose(err as Error);
++      }
+     }
+     if (this.state === PooledConnectionState.closed) {
+       this.connection?.close();
+@@ -148,6 +170,7 @@ class PooledConnection<ConnectionHandle extends NativeConnection = any> {
        return;
      }
      this.connection = connection;
@@ -412,7 +437,7 @@ index ca54dbb..4714b35 100644
      this.state = PooledConnectionState.open;
      this.adapter.connectionOpened(this);
    }
-@@ -156,14 +170,17 @@ class PooledConnection<ConnectionHandle extends NativeConnection = any> {
+@@ -156,14 +179,17 @@ class PooledConnection<ConnectionHandle extends NativeConnection = any> {
      if (this.state === PooledConnectionState.closed) {
        return;
      }
@@ -431,10 +456,23 @@ index ca54dbb..4714b35 100644
        this.retryTimer = setTimeout(PooledConnection.#retryTimerFired, delay, this, err);
        return;
      }
-@@ -192,8 +209,18 @@ class PooledConnection<ConnectionHandle extends NativeConnection = any> {
+@@ -192,8 +218,31 @@ class PooledConnection<ConnectionHandle extends NativeConnection = any> {
      this.#releaseQuery = adapter.release.bind(adapter, this);
    }
  
++  /// What the catch in dial() would do, now: for a caller that blocks, see BaseSQLAdapter#block().
++  failDialNow() {
++    const err = this.dialFailure;
++    if (err == null || this.state !== PooledConnectionState.connecting) {
++      return;
++    }
++    this.dialFailure = null;
++    if ($isObject(err)) {
++      handledDialErrors.add(err);
++    }
++    this.#handleClose(err as Error);
++  }
++
 +  /// What `retryTimer` would do, now: for a caller that slept the pause itself, see BaseSQLAdapter#block().
 +  retryNow() {
 +    const timer = this.retryTimer;
@@ -450,35 +488,76 @@ index ca54dbb..4714b35 100644
      if (self.#canKeepRetrying()) {
        self.dial();
      } else {
-@@ -394,7 +421,7 @@ async function createPooledConnectionHandle<ConnectionHandle>(
+@@ -394,7 +443,7 @@ async function createPooledConnectionHandle<ConnectionHandle>(
    onConnected: (err: Error | null, connection: ConnectionHandle) => void,
    onClose: (err: Error | null) => void,
    onRetire: (() => void) | undefined,
 -  login: Login & { state?: PooledConnectionState },
-+  login: Login & { state?: PooledConnectionState; dialing?: ConnectionHandle | null },
++  login: Login & { state?: PooledConnectionState; dialing?: ConnectionHandle | null; dialFailure?: unknown },
  ): Promise<ConnectionHandle | null> {
    const {
      hostname,
-@@ -437,7 +464,8 @@ async function createPooledConnectionHandle<ConnectionHandle>(
+@@ -437,29 +486,36 @@ async function createPooledConnectionHandle<ConnectionHandle>(
    const prepared = saslprep(password);
    login.otherPassword ??= options.adapter === "postgres" && prepared !== password;
  
 -  return nativeCreateConnection(
-+  // Where a caller that cannot wait for this promise finds it, see BaseSQLAdapter#dialing().
-+  return (login.dialing = nativeCreateConnection(
-     hostname,
-     Number(port),
-     username || "",
-@@ -459,7 +487,7 @@ async function createPooledConnectionHandle<ConnectionHandle>(
-     channelBinding === "disable" ? 0 : channelBinding === "require" ? 2 : 1,
-     transform?.column.from,
-     login.saslprep ? prepared : password,
+-    hostname,
+-    Number(port),
+-    username || "",
+-    password,
+-    database || "",
+-    sslMode,
+-    (tls || null) as Bun.TLSOptions | true | null,
+-    query || "",
+-    path || "",
+-    onConnected,
+-    onClose,
+-    idleTimeout,
+-    connectionTimeout,
+-    maxLifetime,
+-    !prepare,
+-    !!allowPublicKeyRetrieval,
+-    onRetire,
+-    foundRows,
+-    channelBinding === "disable" ? 0 : channelBinding === "require" ? 2 : 1,
+-    transform?.column.from,
+-    login.saslprep ? prepared : password,
 -  );
-+  ));
++  // Where a caller that cannot wait for this promise finds the connection, or what the dial threw: see
++  // BaseSQLAdapter#dialing() and #block().
++  try {
++    return (login.dialing = nativeCreateConnection(
++      hostname,
++      Number(port),
++      username || "",
++      password,
++      database || "",
++      sslMode,
++      (tls || null) as Bun.TLSOptions | true | null,
++      query || "",
++      path || "",
++      onConnected,
++      onClose,
++      idleTimeout,
++      connectionTimeout,
++      maxLifetime,
++      !prepare,
++      !!allowPublicKeyRetrieval,
++      onRetire,
++      foundRows,
++      channelBinding === "disable" ? 0 : channelBinding === "require" ? 2 : 1,
++      transform?.column.from,
++      login.saslprep ? prepared : password,
++    ));
++  } catch (err) {
++    login.dialFailure = err;
++    throw err;
++  }
  }
  
  /// A result of several: CALL <proc>() and a text of several statements.
-@@ -894,6 +922,109 @@ abstract class BaseSQLAdapter<ConnectionHandle extends NativeConnection, QueryHa
+@@ -894,6 +950,128 @@ abstract class BaseSQLAdapter<ConnectionHandle extends NativeConnection, QueryHa
      }
    }
  
@@ -492,6 +571,18 @@ index ca54dbb..4714b35 100644
 +        if (native) {
 +          return native;
 +        }
++      }
++    }
++    return null;
++  }
++
++  /// A connection whose native dial threw, and that has not heard of it yet.
++  #failedDial(): PooledConnection | null {
++    const connections = this.connections;
++    for (let i = 0; i < connections.length; i++) {
++      const connection = connections[i];
++      if (connection.state === PooledConnectionState.connecting && connection.dialFailure != null) {
++        return connection;
 +      }
 +    }
 +    return null;
@@ -522,6 +613,13 @@ index ca54dbb..4714b35 100644
 +      // The close of a connection settles what was on it. One that says it is closed and still has what is
 +      // waited for is not asked again.
 +      if (connection === null || connection === closed) {
++        // A dial that threw where it was started is dealt with by a catch that is a microtask away.
++        const failed = this.#failedDial();
++        if (failed !== null) {
++          failed.failDialNow();
++          closed = null;
++          continue;
++        }
 +        // A dial that failed while the server was starting is tried again after a pause, by a timer that needs
 +        // the event loop. The pause is slept here, and the redial started.
 +        const retrying = this.#retrying();
