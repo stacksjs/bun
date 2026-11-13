@@ -61,6 +61,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        target: [linux-x64, darwin-aarch64]
         include:
           - target: linux-x64
             runner: ubuntu-latest
@@ -80,7 +81,8 @@ jobs:
             final_target: --target=bun
         # `targets: linux` leaves the macOS job out: GitHub's macOS arm64
         # runners can be short, and a look at whether this branch still builds
-        # does not have to wait for one.
+        # does not have to wait for one. (`exclude` takes combinations out of
+        # the `target` list above; `include` only adds to the ones that stay.)
         exclude:
           - target: ${{ inputs.targets == 'linux' && 'darwin-aarch64' || 'none' }}
     defaults:
