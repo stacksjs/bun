@@ -52,16 +52,16 @@ Two things the event loop would otherwise do are done by the waiting call: a dia
 
 ## Status
 
-**Nothing has been released from this repository yet.** The patch is written and is being built and tested; until a release appears under Releases, there is no binary of it to download.
+The first patch is released. Every release is built by `build.yml` from an official tag plus `patches/`, and each target's job ends by running `tests/` with the binary it just built, against a real PostgreSQL 17 and a real MySQL 8.4. A target that fails them fails the build, and nothing is published.
 
-What is proven so far: the release build runs on GitHub's hosted runners. [Run 43340878329](https://github.com/stacksjs/bun/actions/runs/43340878329) built `bun-v1.4.4` unmodified, without cross-language LTO:
+[Run 43422719236](https://github.com/stacksjs/bun/actions/runs/43422719236) is the build the patch was accepted on, 32 of 32 tests on each target:
 
-| Target | Runner | Wall time | `bun --revision` |
-|---|---|---|---|
-| `linux-x64` | `ubuntu-latest` (4 vCPU, 16 GB) | 19 minutes | `1.4.4+38afee6c8` |
-| `darwin-aarch64` | `macos-15` | 27 minutes | `1.4.4+38afee6c8` |
+| Target | Runner | `bun --revision` |
+|---|---|---|
+| `linux-x64` | `ubuntu-latest` (4 vCPU, 16 GB) | `1.4.4` plus the patched revision |
+| `darwin-aarch64` | `macos-15` | `1.4.4` plus the patched revision |
 
-A release is only made from a build whose binaries pass `tests/` against a real PostgreSQL and a real MySQL, on both runners (the `test` job of `build.yml`).
+A build takes about 20 minutes on Linux and 30 on macOS. GitHub's macOS arm64 runners can be short: a job that no runner takes within 15 minutes is cancelled, and the build has to be started again.
 
 What is not done:
 
