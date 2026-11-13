@@ -61,30 +61,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [linux-x64, darwin-aarch64]
-        include:
-          - target: linux-x64
-            runner: ubuntu-latest
-            ninja_jobs: 4
-            extra_flags: ""
-            # Empty = the default targets (stripped `bun`, which pulls the link and its checks).
-            final_target: ""
-          - target: darwin-aarch64
-            runner: macos-15
-            ninja_jobs: 3
-            # Upstream ships macOS binaries with the 13.0 floor (MIN_OSX_DEPLOYMENT_TARGET,
-            # applied automatically only under --ci=on). A local build would otherwise
-            # target the runner SDK's major version.
-            extra_flags: --osx-deployment-target=13.0
-            # The stripped binary only. The default targets on macOS also run dsymutil
-            # over bun-profile, which this experiment does not need.
-            final_target: --target=bun
-        # `targets: linux` leaves the macOS job out: GitHub's macOS arm64
-        # runners can be short, and a look at whether this branch still builds
-        # does not have to wait for one. (`exclude` takes combinations out of
-        # the `target` list above; `include` only adds to the ones that stay.)
-        exclude:
-          - target: ${{ inputs.targets == 'linux' && 'darwin-aarch64' || 'none' }}
+        # One entry per target. `targets: linux` leaves the macOS one out:
+        # GitHub's macOS arm64 runners can be short, and a look at whether
+        # this branch still builds does not have to wait for one.
+        #
+        # ninja_jobs: parallel compile jobs the runner's memory allows.
+        # extra_flags: upstream ships macOS binaries with the 13.0 floor
+        #   (MIN_OSX_DEPLOYMENT_TARGET, applied automatically only under
+        #   --ci=on); a local build would otherwise target the runner SDK's
+        #   major version.
+        # final_target: empty is the default targets (the stripped `bun`,
+        #   which pulls the link and its checks). On macOS those also run
+        #   dsymutil over bun-profile, which is not needed here.
+        include: ${{ fromJSON(inputs.targets == 'linux' && '[{"target":"linux-x64","runner":"ubuntu-latest","ninja_jobs":4,"extra_flags":"","final_target":""}]' || '[{"target":"linux-x64","runner":"ubuntu-latest","ninja_jobs":4,"extra_flags":"","final_target":""},{"target":"darwin-aarch64","runner":"macos-15","ninja_jobs":3,"extra_flags":"--osx-deployment-target=13.0","final_target":"--target=bun"}]') }}
     defaults:
       run:
         shell: bash
