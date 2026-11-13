@@ -467,6 +467,61 @@ jobs:
           path: bun/build/release/bun-${{ matrix.target }}.zip
           if-no-files-found: error
 
+      # ────────────────────────────── tests ──────────────────────────────
+      # What the patches add, run by the binary that was just built, against a
+      # real PostgreSQL and a real MySQL. Nothing is released that did not
+      # pass: the release job needs every target's job, and these are its last
+      # steps. After the upload, so a binary that fails them can be fetched
+      # and looked at.
+
+      - name: Start PostgreSQL and MySQL (Linux)
+        if: runner.os == 'Linux' && env.PATCH_COUNT != '0'
+        run: |
+          docker run -d --name pg -e POSTGRES_HOST_AUTH_METHOD=trust -p 5432:5432 postgres:17
+          docker run -d --name my -e MYSQL_ALLOW_EMPTY_PASSWORD=yes -e MYSQL_DATABASE=test -p 3306:3306 mysql:8.4
+          for i in $(seq 1 90); do
+            if docker exec pg pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1 \
+              && docker exec my mysqladmin ping -h 127.0.0.1 -uroot --silent >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          docker exec pg pg_isready -U postgres -h 127.0.0.1
+          docker exec my mysqladmin ping -h 127.0.0.1 -uroot
+          echo "POSTGRES_URL=postgres://postgres@127.0.0.1:5432/postgres" >> "$GITHUB_ENV"
+          echo "MYSQL_URL=mysql://root@127.0.0.1:3306/test" >> "$GITHUB_ENV"
+
+      - name: Start PostgreSQL and MySQL (macOS)
+        if: runner.os == 'macOS' && env.PATCH_COUNT != '0'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          brew install postgresql@17 mysql
+          brew services start postgresql@17
+          brew services start mysql
+          pg_bin="$(brew --prefix postgresql@17)/bin"
+          for i in $(seq 1 90); do
+            if "$pg_bin/pg_isready" -h 127.0.0.1 >/dev/null 2>&1 \
+              && mysqladmin ping -h 127.0.0.1 -uroot --silent >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          "$pg_bin/pg_isready" -h 127.0.0.1
+          mysqladmin ping -h 127.0.0.1 -uroot
+          mysql -h 127.0.0.1 -uroot -e 'create database if not exists test'
+          echo "POSTGRES_URL=postgres://$(whoami)@127.0.0.1:5432/postgres" >> "$GITHUB_ENV"
+          echo "MYSQL_URL=mysql://root@127.0.0.1:3306/test" >> "$GITHUB_ENV"
+
+      - name: Run the tests with the built binary
+        if: env.PATCH_COUNT != '0'
+        working-directory: fork
+        env:
+          SYNC_SQL_REQUIRE: "1"
+        run: |
+          "$GITHUB_WORKSPACE/bun/build/release/bun" --revision
+          "$GITHUB_WORKSPACE/bun/build/release/bun" test tests/
+
       # ─────────────────────────── diagnostics ───────────────────────────
 
       - name: Build timings
@@ -510,97 +565,13 @@ jobs:
             bun/build/release/timings.html
           if-no-files-found: ignore
 
-  # What the patches add, run by the binary that was just built, against a
-  # real PostgreSQL and a real MySQL. Nothing is released that did not pass.
-  test:
-    name: Test ${{ matrix.target }}
-    needs: build
-    if: ${{ needs.build.outputs.patch_count != '0' }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: linux-x64
-            runner: ubuntu-latest
-          - target: darwin-aarch64
-            runner: macos-15
-    defaults:
-      run:
-        shell: bash
-    env:
-      HOMEBREW_NO_INSTALL_CLEANUP: "1"
-      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
-      HOMEBREW_NO_AUTO_UPDATE: "1"
-    steps:
-      - name: Check out the tests
-        uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      - name: Download the binary
-        uses: actions/download-artifact@v7
-        with:
-          name: bun-${{ matrix.target }}
-          path: dist
-
-      - name: Unpack it
-        run: |
-          unzip -q "dist/bun-${{ matrix.target }}.zip" -d dist
-          echo "BUILT_BUN=$PWD/dist/bun-${{ matrix.target }}/bun" >> "$GITHUB_ENV"
-          "dist/bun-${{ matrix.target }}/bun" --revision
-
-      - name: Start PostgreSQL and MySQL (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          docker run -d --name pg -e POSTGRES_HOST_AUTH_METHOD=trust -p 5432:5432 postgres:17
-          docker run -d --name my -e MYSQL_ALLOW_EMPTY_PASSWORD=yes -e MYSQL_DATABASE=test -p 3306:3306 mysql:8.4
-          for i in $(seq 1 90); do
-            if docker exec pg pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1 \
-              && docker exec my mysqladmin ping -h 127.0.0.1 -uroot --silent >/dev/null 2>&1; then
-              break
-            fi
-            sleep 2
-          done
-          docker exec pg pg_isready -U postgres -h 127.0.0.1
-          docker exec my mysqladmin ping -h 127.0.0.1 -uroot
-          echo "POSTGRES_URL=postgres://postgres@127.0.0.1:5432/postgres" >> "$GITHUB_ENV"
-          echo "MYSQL_URL=mysql://root@127.0.0.1:3306/test" >> "$GITHUB_ENV"
-
-      - name: Start PostgreSQL and MySQL (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install postgresql@17 mysql
-          brew services start postgresql@17
-          brew services start mysql
-          pg_bin="$(brew --prefix postgresql@17)/bin"
-          for i in $(seq 1 90); do
-            if "$pg_bin/pg_isready" -h 127.0.0.1 >/dev/null 2>&1 \
-              && mysqladmin ping -h 127.0.0.1 -uroot --silent >/dev/null 2>&1; then
-              break
-            fi
-            sleep 2
-          done
-          "$pg_bin/pg_isready" -h 127.0.0.1
-          mysqladmin ping -h 127.0.0.1 -uroot
-          mysql -h 127.0.0.1 -uroot -e 'create database if not exists test'
-          echo "POSTGRES_URL=postgres://$(whoami)@127.0.0.1:5432/postgres" >> "$GITHUB_ENV"
-          echo "MYSQL_URL=mysql://root@127.0.0.1:3306/test" >> "$GITHUB_ENV"
-
-      - name: Run the tests with the built binary
-        env:
-          SYNC_SQL_REQUIRE: "1"
-        run: |
-          # Not as CI: `bun test` then refuses a test.only and prints differently, nothing more.
-          "$BUILT_BUN" test tests/
-
   # A release is "that official tag, plus these patches". With no patches
   # there is nothing of ours to release: the official binary is the same thing.
   release:
     name: Publish
-    needs: [build, test]
-    if: ${{ inputs.publish && needs.build.result == 'success' && needs.test.result == 'success' && needs.build.outputs.patch_count != '0' }}
+    # Each target's build job ends with the tests: a target that failed them did not succeed.
+    needs: build
+    if: ${{ inputs.publish && needs.build.result == 'success' && needs.build.outputs.patch_count != '0' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
