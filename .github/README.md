@@ -1,0 +1,116 @@
+# stacksjs/bun
+
+[Bun](https://github.com/oven-sh/bun), with what Stacks needs added to it, kept on upstream's main and released for every official release.
+
+This is Bun's own README's neighbour: the one at the root is upstream's, untouched. This one is about the fork.
+
+## How the fork is laid out
+
+The `stacks` branch is upstream's `main` with our commits on it. It is merged from upstream every six hours, never rebased, so it only ever grows, and GitHub's "ahead / behind" line reads as it should: ahead by our commits, behind by at most a few hours.
+
+What is ours in the tree:
+
+- **The changes to Bun's own source.** Ordinary commits. Today that is one change, described below.
+- `stacks/` - what belongs to the fork and not to Bun: `tests/` (run against every binary that is built), `patches/<tag>/` (a patch series pinned for one official release), `UPSTREAM` (the upstream commit this branch last merged) and `BUILDING.md`.
+- `.github/workflows/stacks-sync.yml` - merges upstream, and starts a build when there is something to build.
+- `.github/workflows/stacks-build.yml` - builds, tests and publishes.
+
+Upstream's own workflows are not kept. They run on upstream's infrastructure and are removed again from each merge.
+
+The `main` branch is GitHub's copy of upstream's `main`. Nothing here reads it; `stacks` merges from upstream directly.
+
+## What it adds
+
+Synchronous queries on Bun's MySQL and Postgres drivers. `bun:sqlite` runs a query where it is called; `Bun.sql` answers with a promise. With this fork a statement can be waited for where it is issued:
+
+```ts
+import { SQL } from 'bun'
+
+const sql = new SQL('postgres://localhost/app')
+
+const users = sql`select * from users where id = ${id}`.executeSync() // the rows, or a throw
+const orders = sql.unsafe('select * from orders where user_id = $1', [id]).executeSync(5000)
+
+const tx = sql.reserveSync() // a connection of the caller's own
+tx.unsafe('BEGIN').executeSync()
+tx.unsafe('update accounts set balance = balance - 10 where id = 1').executeSync()
+tx.unsafe('COMMIT').executeSync()
+tx.release()
+```
+
+| Call | What it does |
+|---|---|
+| `query.executeSync(ms?)` | Runs the statement and returns its result, or throws what it failed with. After `ms` milliseconds without an answer it throws `ERR_POSTGRES_SYNC_TIMEOUT` / `ERR_MYSQL_SYNC_TIMEOUT`; the statement keeps running and can still be awaited or cancelled. |
+| `query.wait(ms?)` | Starts the statement and blocks until it has settled. `true`: settled. `false`: `ms` passed. `null`: nothing this thread can wait on, so only the event loop can settle it. |
+| `query.cancelSync(ms?)` | `cancel()`, then blocks until the request to stop the statement has reached the server. PostgreSQL sends that request on a connection of its own; left to the event loop it would go out after whatever the caller does next. |
+| `sql.reserveSync(ms?)` | `sql.reserve()` where it is called. `undefined` when no connection can be had without the event loop turning. |
+
+Everything else is Bun's own API, unchanged, and a statement that is awaited behaves as before. The two can be mixed.
+
+### How it waits
+
+The calling thread blocks on the socket of the one connection that has the answer, and what arrives on that socket is handled exactly as a tick of the event loop would handle it, TLS and connecting included. The event loop itself does not turn. So while a statement is waited for, nothing else of the program runs: no other socket, no timer, no microtask. That is what `bun:sqlite` has always done, and it is the point: a nested tick would run other requests in the middle of the caller's statement.
+
+It follows that a statement cannot be waited for when what it needs can only come from the event loop: a connection that code which `await`s is holding, or a password that is a promise. `wait()` says so with `null` instead of blocking for nothing.
+
+Two things the event loop would otherwise do are done by the waiting call: a dial that failed because the server was still starting is tried again after its pause, and once a second the idle connections are read, so one that the server closed while the program did not yield leaves the pool before a statement is put on it.
+
+### Who uses it
+
+[bun-query-builder](https://github.com/stacksjs/bun-query-builder), and through it Stacks' models and `db`: `const user = User.where(...).first()` is the row on SQLite, MySQL and Postgres. On stock Bun it gets there by keeping the connection on a worker thread and blocking the caller on it. On this Bun it uses the calls above on the calling thread: no second thread, and no copy of the rows between two. It looks at the runtime and picks; nothing in Stacks requires this fork.
+
+## Releases
+
+A release is an official release with our changes on it, never this branch as it is: `bun-v1.4.4-stacks.1` is `bun-v1.4.4` plus the changes. Its assets use the official names (`bun-linux-x64.zip`, `bun-darwin-aarch64.zip`) and layout, with a `SHASUMS256.txt` beside them.
+
+`stacks-sync` looks for the latest official release every six hours. If there is none of ours for it, it starts `stacks-build` for that tag, which:
+
+1. checks the tag out from oven-sh/bun;
+2. puts our changes on it: the series in `stacks/patches/<tag>/` if that tag has one, otherwise everything this branch changes in Bun's source (the difference to `stacks/UPSTREAM`, without `.github` and `stacks/`), merged onto the tag three ways;
+3. builds each target, and runs `stacks/tests/` with the binary it built, against a real PostgreSQL 17 and a real MySQL 8.4;
+4. publishes, if every target built and passed. A target that fails fails the build, and nothing is published: the previous release stays the latest.
+
+So a new official release becomes ours without anyone asking, as long as the changes still fit it.
+
+## When upstream changes the same code
+
+There are two moments this can show, and the first is the reason the branch follows `main`:
+
+- **A merge of upstream conflicts.** `stacks-sync` pushes nothing and opens an issue naming the files. Merge by hand, carry the change forward, push:
+
+  ```bash
+  git fetch https://github.com/oven-sh/bun.git main
+  git merge FETCH_HEAD            # resolve; keep upstream's workflows deleted
+  git rev-parse FETCH_HEAD > stacks/UPSTREAM && git add stacks/UPSTREAM
+  git commit && git push
+  ```
+
+  After every merge the branch is built as it is (Linux), so a change of upstream's that breaks ours without a conflict is seen as well.
+
+- **The changes do not fit an official tag.** The tag is older than the `main` the changes are written against, and upstream may have rewritten the same code in between. The build then stops at "Put our changes on the tag". Make the series for that tag and commit it under `stacks/patches/<tag>/`:
+
+  ```bash
+  git clone --depth 1 --branch <tag> https://github.com/oven-sh/bun.git && cd bun
+  # ... make the change on the tag, commit ...
+  git format-patch -N --zero-commit -o ../stacks/patches/<tag> <tag>
+  ```
+
+  `bun-v1.4.4` has one: upstream moved the Postgres connection to another binding generator and rewrote the resolver after it.
+
+## The token a merge needs
+
+A merge of upstream carries upstream's commits, and some of those change upstream's workflow files. GitHub does not let the token of a workflow run push such commits. `stacks-sync` uses the secret `STACKS_SYNC_TOKEN` when it is set: a fine-grained personal access token for this repository with **Contents** and **Workflows** set to read and write. Without it a merge is pushed only when the commits it brings touch no workflow file, and fails otherwise until the next one that can.
+
+## Status
+
+Released: the changes above, on `bun-v1.4.4`. The build they were accepted on is [run 43422719236](https://github.com/stacksjs/bun/actions/runs/43422719236): 32 of 32 tests on `linux-x64` (`ubuntu-latest`) and on `darwin-aarch64` (`macos-15`).
+
+A build takes about 20 minutes on Linux and 30 on macOS. GitHub's macOS arm64 runners can be short: a job that no runner takes within 15 minutes is cancelled, and that job has to be run again.
+
+What is not done:
+
+- **The Linux binary needs glibc 2.43**, the runner's. Upstream links against a glibc 2.31 sysroot so its binary runs on older distributions; that sysroot is not provisioned here yet (the recipe is in upstream's `scripts/build/ci-images/spec.ts`, see `stacks/BUILDING.md`).
+- **Two targets of upstream's eighteen.** No `linux-aarch64`, musl, Windows, FreeBSD or Android builds, and no `-profile` zips. On Windows the calls answer that there is nothing to wait on.
+- **No cross-language LTO**, which upstream ships with. It needs far more memory at link than a hosted runner has.
+- **TLS connections are not covered by the tests.** The code path is the event loop's own, but no test server here speaks TLS.
+- **No type declarations.** `bun-types` does not know the calls.

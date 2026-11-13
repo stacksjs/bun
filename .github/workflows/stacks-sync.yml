@@ -1,0 +1,158 @@
+name: Sync upstream
+
+# Keeps this branch on upstream's main, and turns an official release into
+# ours without anyone asking. Every six hours:
+#
+# 1. Merge oven-sh/bun's main into this branch. A merge, never a rebase: the
+#    branch is only ever added to. Upstream's own workflows are not kept (they
+#    are theirs to run, on their infrastructure), so they are removed again
+#    from each merge.
+# 2. If upstream changed code that our changes touch, the merge conflicts.
+#    Nothing is pushed, and an issue says which files: that is the moment to
+#    carry the change forward, long before a release needs it.
+# 3. After a merge, build this branch as it is (Linux), so that a change of
+#    upstream's that breaks ours without a conflict is seen too.
+# 4. If the latest official release has no release here yet, build it with our
+#    changes and publish it (stacks-build.yml).
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+  issues: write
+
+concurrency:
+  group: stacks-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/oven-sh/bun.git
+
+jobs:
+  merge:
+    name: Merge upstream main
+    runs-on: ubuntu-latest
+    outputs:
+      merged: ${{ steps.merge.outputs.merged }}
+    steps:
+      - name: Check out this branch with its history, and no files that are not needed
+        uses: actions/checkout@v7
+        with:
+          # Commits only: the trees and files a merge needs are fetched as it asks for them.
+          fetch-depth: 0
+          filter: tree:0
+          # Only the fork's own folders are written out. A merge works on the
+          # index, and writes out a file of Bun's only if it conflicts.
+          sparse-checkout: |
+            .github
+            stacks
+          # A push that carries upstream's commits carries their changes to
+          # upstream's workflow files. The token of a run may not push those;
+          # a token that may is used where one is set (see .github/README.md).
+          token: ${{ secrets.STACKS_SYNC_TOKEN || github.token }}
+
+      - name: Merge
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "bun-fork-ci"
+          git config user.email "bun-fork-ci@users.noreply.github.com"
+          # Upstream's objects are asked of upstream, as they are needed.
+          git remote add upstream "$UPSTREAM"
+          git config remote.upstream.promisor true
+          git config remote.upstream.partialclonefilter tree:0
+          git fetch --quiet --filter=tree:0 upstream main
+          theirs="$(git rev-parse FETCH_HEAD)"
+          if git merge-base --is-ancestor "$theirs" HEAD; then
+            echo "Already has upstream ${theirs}."
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          behind="$(git rev-list --count "HEAD..$theirs")"
+          echo "Merging ${behind} commit(s) of upstream, up to ${theirs}"
+
+          git merge --no-ff --no-commit "$theirs" || true
+
+          # Upstream's workflows are not ours to run. Ours are stacks-*.yml.
+          while IFS= read -r file; do
+            case "$(basename "$file")" in
+              stacks-*) ;;
+              *.yml|*.yaml) git rm --quiet --force -- "$file" ;;
+            esac
+          done < <(git ls-files -- .github/workflows | sort -u)
+
+          conflicts="$(git diff --name-only --diff-filter=U)"
+          if [ -n "$conflicts" ]; then
+            {
+              echo "Upstream's main (\`${theirs}\`) changed code that this fork's changes touch. The merge was not made:"
+              echo
+              printf -- '- `%s`\n' $conflicts
+              echo
+              echo "Merge \`oven-sh/bun\` main into \`${GITHUB_REF_NAME}\` by hand, carry the change forward, and push. See \`.github/README.md\`, \"When upstream changes the same code\"."
+              echo
+              echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            } > "$RUNNER_TEMP/conflict.md"
+            cat "$RUNNER_TEMP/conflict.md"
+            title="Upstream changed the code under our changes"
+            existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty' || true)"
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/conflict.md" || true
+            else
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$RUNNER_TEMP/conflict.md" || true
+            fi
+            git merge --abort || true
+            exit 1
+          fi
+
+          # What the changes of this branch are measured against (stacks-build.yml).
+          printf '%s\n' "$theirs" > stacks/UPSTREAM
+          git add stacks/UPSTREAM
+          git commit --quiet -m "sync: merge oven-sh/bun main at ${theirs:0:12}" -m "${behind} commit(s) of upstream."
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Start builds
+    needs: merge
+    # Also when the merge had nothing to do: a release can be missing all the same.
+    if: ${{ !cancelled() && needs.merge.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build this branch after a merge
+        if: needs.merge.outputs.merged == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run stacks-build.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f targets=linux
+
+      - name: Find an official release this repository has not built
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(gh api repos/oven-sh/bun/releases/latest --jq .tag_name)"
+          echo "latest official release: $tag"
+          # Ours are named <official tag>-stacks.<n>.
+          built="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName --jq '.[].tagName' | grep -c "^${tag}-stacks\." || true)"
+          # One attempt per official tag per state of this branch. A build that
+          # failed (changes that no longer merge onto the tag, a runner that
+          # never came) is not retried every six hours: it is retried when the
+          # branch changes, which every merge of upstream does, or by hand.
+          head="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_REF_NAME}" --jq .sha)"
+          tried="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow stacks-build.yml --limit 100 --json headSha,displayTitle --jq "[.[] | select(.headSha == \"$head\") | select(.displayTitle | contains(\"$tag\"))] | length")"
+          echo "releases built from it here: $built, builds of it at ${head}: $tried"
+          if [ "$built" = "0" ] && [ "$tried" = "0" ]; then
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and publish it
+        if: steps.find.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run stacks-build.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f tag="${{ steps.find.outputs.tag }}" -f publish=true

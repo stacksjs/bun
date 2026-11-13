@@ -1,0 +1,3 @@
+# The fork's tests are run from this folder, so that this is the configuration
+# they get and not the one Bun's own test suite uses at the root.
+[test]
