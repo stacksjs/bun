@@ -262,6 +262,31 @@ for (const dialect of dialects) {
       expect(after).not.toBe(id)
     })
 
+    test('a statement waited for inside a request handler leaves the rest of the request alone', async () => {
+      // The handler runs in the middle of the read that brought the request: the body behind the headers is
+      // still in the event loop's receive buffer when the statement's own rows are read.
+      const body = new Uint8Array(300 * 1024)
+      for (let i = 0; i < body.length; i++)
+        body[i] = 65 + (i % 23)
+      const server = Bun.serve({
+        port: 0,
+        async fetch(request) {
+          const rows = sql.unsafe(dialect.wide(600)).executeSync()
+          const received = await request.arrayBuffer()
+          return Response.json({ rows: rows.length, length: received.byteLength, hash: String(Bun.hash(received)) })
+        },
+      })
+      try {
+        for (let round = 0; round < 3; round++) {
+          const response = await fetch(server.url, { method: 'POST', body })
+          expect(await response.json()).toEqual({ rows: 600, length: body.byteLength, hash: String(Bun.hash(body)) })
+        }
+      }
+      finally {
+        await server.stop(true)
+      }
+    })
+
     test('a statement waited for inside an awaited transaction of the same program', async () => {
       const result = await sql.begin(async (tx: any) => {
         await tx.unsafe('select 1')
