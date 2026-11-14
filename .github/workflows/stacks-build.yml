@@ -686,11 +686,22 @@ jobs:
           # <official tag>-stacks.<n>: n counts our releases of that tag.
           existing="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName --jq '.[].tagName' | grep -c "^${UPSTREAM_TAG}-stacks\\." || true)"
           name="${UPSTREAM_TAG}-stacks.$((existing + 1))"
-          gh release create "$name" dist/bun-*.zip dist/SHASUMS256.txt \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "$name" \
-            --notes "Bun ${UPSTREAM_TAG} with the changes of this repository at ${GITHUB_SHA}: query.wait(), query.executeSync(), query.cancelSync() and sql.reserveSync() on the MySQL and Postgres drivers. Built and tested by run ${GITHUB_RUN_ID}."
+          notes="Bun ${UPSTREAM_TAG} with the changes of this repository at ${GITHUB_SHA}: query.wait(), query.executeSync(), query.cancelSync() and sql.reserveSync() on the MySQL and Postgres drivers. Built and tested by run ${GITHUB_RUN_ID}."
+          # The tag belongs on the commit that was built. This job's token was refused that
+          # for bun-v1.4.4-stacks.3 ("Resource not accessible by integration"), twice, after
+          # a push during the build had changed this workflow: most likely the token may not
+          # tag a commit whose workflow files are not the branch's current ones. That is a
+          # reading of one failure, not a documented rule, so the branch is simply tried
+          # next. The notes name the commit either way, and the binaries are the same.
+          for target in "$GITHUB_SHA" "$GITHUB_REF_NAME"; do
+            if gh release create "$name" dist/bun-*.zip dist/SHASUMS256.txt \
+              --repo "$GITHUB_REPOSITORY" --target "$target" --title "$name" --notes "$notes"; then
+              echo "Released ${name}, tagged at ${target}"
+              exit 0
+            fi
+            echo "::warning::The release could not be tagged at ${target}."
+          done
+          exit 1
 
       # The pantry registry publishes each release as `stacksjs.com/bun`
       # (bun-v1.4.4-stacks.2 is version 1.4.4.2 there). It looks for new ones

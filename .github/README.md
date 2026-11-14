@@ -12,7 +12,7 @@ What is ours in the tree:
 
 - **The changes to Bun's own source.** Ordinary commits. Today that is one change, described below.
 - `test/js/sql/sql-sync.test.ts` and a section of `docs/runtime/sql.mdx` - the tests and the documentation of that change, where Bun keeps its own.
-- `stacks/` - what belongs to the fork and not to Bun: `tests/` (how those tests are run here, against every binary that is built), `patches/<tag>/` (a patch series pinned for one official release), `UPSTREAM` (the upstream commit this branch last merged) and `BUILDING.md`.
+- `stacks/` - what belongs to the fork and not to Bun: `tests/` (how those tests are run here, against every binary that is built), `bench/` (what the change saves, measured by every Linux build), `patches/<tag>/` (a patch series pinned for one official release), `UPSTREAM` (the upstream commit this branch last merged) and `BUILDING.md`.
 - `.github/workflows/stacks-sync.yml` - merges upstream, and starts a build when there is something to build.
 - `.github/workflows/stacks-build.yml` - builds, tests and publishes.
 
@@ -106,9 +106,47 @@ SYNC_SQL_POSTGRES_PLAIN=127.0.0.1:5432 SYNC_SQL_MYSQL_PLAIN=127.0.0.1:3306 \
 
 `harness.ts` says what each server has to be. One that is not named is skipped, unless `SYNC_SQL_REQUIRE` lists it. The build runs all four on Linux (PostgreSQL 17 and MySQL 8.4, the TLS ones built from the Dockerfiles and certificates in `test/js/sql`) and the two plain ones on macOS, whose runner has no docker.
 
-## Upstream
+## Upstream, and why this is a fork
 
-The change was proposed to Bun as [oven-sh/bun#48947](https://github.com/oven-sh/bun/issues/48947), with [oven-sh/bun#48948](https://github.com/oven-sh/bun/pull/48948) as the implementation. The issue was closed as not planned: `Bun.sql` is async on every adapter by design, and Bun does not want a call in the runtime that blocks the JS thread on a network socket. The suggested alternative is the worker thread that bun-query-builder already uses on official Bun. So this fork is where the change lives.
+The change was proposed to Bun as [oven-sh/bun#48947](https://github.com/oven-sh/bun/issues/48947), with [oven-sh/bun#48948](https://github.com/oven-sh/bun/pull/48948) as the implementation: this branch's change on Bun's `main`, with the types, the docs and the tests.
+
+The issue was closed as not planned ([the reasons](https://github.com/oven-sh/bun/issues/48947#issuecomment-6883154514)):
+
+- `Bun.sql` returns promises on every adapter by design, SQLite included.
+- Bun does not want a call in the runtime that blocks the JavaScript thread on a network socket. `Bun.spawnSync` waits on an event loop of its own for that reason; this change dispatches a socket of the main loop outside a tick.
+- The same result is possible on official Bun today: a worker thread owns the connection, and the caller waits for it with `Atomics.wait()` and `receiveMessageOnPort()`.
+
+That last point is true, and it is what [bun-query-builder](https://github.com/stacksjs/bun-query-builder) does on official Bun. So nothing needs this fork to work. What the fork is for is what that worker costs, which the next section measures. The pull request stays open; its review found real defects, which are fixed here and there.
+
+## What it saves
+
+`stacks/bench/sync-sql.bench.ts` times one query three ways on the Bun that runs it: `executeSync()`, the worker thread described above, and `await` for scale. Every Linux build runs it after the tests and writes the table to the run's summary. From [run 43642390000](https://github.com/stacksjs/bun/actions/runs/43642390000), on a GitHub-hosted `ubuntu-24.04` runner with PostgreSQL 17 and MySQL 8.4 on the same machine, in microseconds per query on one connection, the fastest of 9 rounds with the median in brackets:
+
+| Server | Query | `executeSync()` | Worker thread | `await` | Worker over `executeSync()` |
+| --- | --- | --- | --- | --- | --- |
+| PostgreSQL | select 1 | 60 (63) | 84 (87) | 60 (63) | 1.40x |
+| PostgreSQL | 100 rows of 1 KB | 180 (183) | 234 (244) | 169 (172) | 1.30x |
+| PostgreSQL | 1000 rows of 1 KB | 1062 (1120) | 1482 (1516) | 1020 (1102) | 1.40x |
+| MySQL | select 1 | 63 (64) | 83 (87) | 60 (64) | 1.31x |
+| MySQL | 100 rows of 1 KB | 323 (332) | 404 (408) | 318 (339) | 1.25x |
+| MySQL | 1000 rows of 1 KB | 2594 (2771) | 3105 (3197) | 2661 (2762) | 1.20x |
+
+What the numbers say:
+
+- `executeSync()` costs what `await` costs. Waiting on the socket adds nothing that can be measured here.
+- The worker takes 1.2 to 1.4 times as long: about 20 microseconds more on the smallest query, and about half a millisecond more on a megabyte of rows, which is the copy from one thread to the other.
+- The database is on the same machine. Over a network the round trip is added to all three columns alike, so the ratio shrinks toward 1 while the difference in microseconds stays.
+
+Beyond time, the worker is a second thread with a JavaScript heap of its own in every process, and the rows the caller gets are copies, not the driver's own objects.
+
+To measure on another machine, with the servers the tests use:
+
+```bash
+SYNC_SQL_POSTGRES_PLAIN=127.0.0.1:5432 SYNC_SQL_MYSQL_PLAIN=127.0.0.1:3306 \
+  path/to/bun stacks/bench/sync-sql.bench.ts
+```
+
+On official Bun the `executeSync()` column reads "not on this Bun" and the other two are measured.
 
 ## When upstream changes the same code
 
