@@ -599,6 +599,15 @@ jobs:
           # stacks/tests/harness.ts in the place of Bun's docker harness.
           "$GITHUB_WORKSPACE/fork/stacks/tests/run.sh" "$GITHUB_WORKSPACE/bun/build/release/bun"
 
+      # What executeSync() saves over the worker thread that official Bun needs for the
+      # same thing, measured on this runner and written to the run's summary. The README
+      # quotes a run of it. A measurement, not a gate: it cannot fail a build.
+      - name: Measure executeSync() against a worker thread
+        if: runner.os == 'Linux' && env.PATCH_COUNT != '0'
+        continue-on-error: true
+        run: |
+          "$GITHUB_WORKSPACE/bun/build/release/bun" "$GITHUB_WORKSPACE/fork/stacks/bench/sync-sql.bench.ts"
+
       # ─────────────────────────── diagnostics ───────────────────────────
 
       - name: Build timings
