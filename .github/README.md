@@ -45,6 +45,12 @@ tx.release()
 | `query.cancelSync(ms?)` | `cancel()`, then blocks until the request to stop the statement has reached the server. PostgreSQL sends that request on a connection of its own; left to the event loop it would go out after whatever the caller does next. |
 | `sql.reserveSync(ms?)` | `sql.reserve()` where it is called. `undefined` when no connection can be had without the event loop turning. |
 
+The types: `packages/bun-types` in this repository declares the four calls, but the `bun-types` on npm is official Bun's and does not. A project gets them from [bun-query-builder](https://github.com/stacksjs/bun-query-builder), opt-in, with one line in any of its files:
+
+```ts
+/// <reference types="bun-query-builder/bun-sync" />
+```
+
 Everything else is Bun's own API, unchanged, and a statement that is awaited behaves as before. The two can be mixed.
 
 ### How it waits
@@ -127,4 +133,3 @@ What is not done:
 - **Two targets of upstream's eighteen.** No `linux-aarch64`, musl, Windows, FreeBSD or Android builds, and no `-profile` zips. On Windows the calls answer that there is nothing to wait on.
 - **No cross-language LTO**, which upstream ships with. It needs far more memory at link than a hosted runner has.
 - **TLS connections are not covered by the tests.** The code path is the event loop's own, but no test server here speaks TLS.
-- **No type declarations.** `bun-types` does not know the calls.
