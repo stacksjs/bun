@@ -65,6 +65,12 @@ jobs:
         # GitHub's macOS arm64 runners can be short, and a look at whether
         # this branch still builds does not have to wait for one.
         #
+        # runner: Linux is `ubuntu-24.04` by name, never `ubuntu-latest`. The
+        #   binary links against the runner's glibc and so starts only where
+        #   glibc is at least that new. `ubuntu-latest` became 26.04 (glibc
+        #   2.43) and `bun-v1.4.4-stacks.1`, built there, does not start on
+        #   24.04, which is what servers run and the newest glibc the pantry
+        #   registry publishes for (GLIBC_CEILING below).
         # ninja_jobs: parallel compile jobs the runner's memory allows.
         # extra_flags: upstream ships macOS binaries with the 13.0 floor
         #   (MIN_OSX_DEPLOYMENT_TARGET, applied automatically only under
@@ -73,7 +79,7 @@ jobs:
         # final_target: empty is the default targets (the stripped `bun`,
         #   which pulls the link and its checks). On macOS those also run
         #   dsymutil over bun-profile, which is not needed here.
-        include: ${{ fromJSON(inputs.targets == 'linux' && '[{"target":"linux-x64","runner":"ubuntu-latest","ninja_jobs":4,"extra_flags":"","final_target":""}]' || '[{"target":"linux-x64","runner":"ubuntu-latest","ninja_jobs":4,"extra_flags":"","final_target":""},{"target":"darwin-aarch64","runner":"macos-15","ninja_jobs":3,"extra_flags":"--osx-deployment-target=13.0","final_target":"--target=bun"}]') }}
+        include: ${{ fromJSON(inputs.targets == 'linux' && '[{"target":"linux-x64","runner":"ubuntu-24.04","ninja_jobs":4,"extra_flags":"","final_target":""}]' || '[{"target":"linux-x64","runner":"ubuntu-24.04","ninja_jobs":4,"extra_flags":"","final_target":""},{"target":"darwin-aarch64","runner":"macos-15","ninja_jobs":3,"extra_flags":"--osx-deployment-target=13.0","final_target":"--target=bun"}]') }}
     defaults:
       run:
         shell: bash
@@ -83,6 +89,8 @@ jobs:
       # --lto=off still leaves the Rust crates as ThinLTO bitcode that the link optimises.
       BUILD_FLAGS: --profile=release --canary=off --lto=${{ inputs.lto && 'on' || 'off' }} ${{ matrix.extra_flags }}
       NINJA_JOBS: ${{ matrix.ninja_jobs }}
+      # The newest glibc a Linux binary may need: Ubuntu 24.04's, and the pantry registry's limit.
+      GLIBC_CEILING: "2.39"
       UPSTREAM_TAG: ${{ inputs.tag }}
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
       HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
@@ -459,9 +467,15 @@ jobs:
           esac
           if [ "$RUNNER_OS" = Linux ]; then
             # Upstream's ceiling is GLIBC_2.17, which it gets from a glibc 2.31
-            # sysroot. This build links against the runner's glibc (see NOTES.md).
+            # sysroot. This build links against the runner's glibc, so the
+            # runner decides where the binary starts, and a runner image that
+            # moved would only show on the machine that cannot start it.
             floor="$(objdump -T "$exe" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -n 1 || true)"
             echo "Highest glibc symbol version required: ${floor:-unknown}"
+            if [ -z "$floor" ] || [ "$(printf '%s\n' "${floor#GLIBC_}" "$GLIBC_CEILING" | sort -V | tail -n 1)" != "$GLIBC_CEILING" ]; then
+              echo "::error::The binary needs ${floor:-an unknown glibc}; nothing newer than GLIBC_${GLIBC_CEILING} is released."
+              exit 1
+            fi
           fi
           {
             echo "### ${TRIPLET}"
@@ -644,4 +658,30 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "$name" \
             --notes "Bun ${UPSTREAM_TAG} with the changes of this repository at ${GITHUB_SHA}: query.wait(), query.executeSync(), query.cancelSync() and sql.reserveSync() on the MySQL and Postgres drivers. Built and tested by run ${GITHUB_RUN_ID}."
+
+      # The pantry registry publishes each release as `stacksjs.com/bun`
+      # (bun-v1.4.4-stacks.2 is version 1.4.4.2 there). It looks for new ones
+      # every hour by itself; this only saves the wait. So nothing here can
+      # fail a release that is already out.
+      - name: Tell the pantry registry there is a release
+        env:
+          PANTRY_TOKEN: ${{ secrets.PANTRY_TOKEN }}
+        run: |
+          if [ -z "${PANTRY_TOKEN:-}" ]; then
+            echo "::notice::No PANTRY_TOKEN: the registry finds the release on its next hourly sweep."
+            exit 0
+          fi
+          if ! code="$(curl -sS -o "$RUNNER_TEMP/pantry.out" -w '%{http_code}' --max-time 30 \
+            -X POST https://registry.pantry.dev/api/rebuild \
+            -H "Authorization: Bearer $PANTRY_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d '{"domain":"stacksjs.com/bun"}')"; then
+            echo "::warning::The registry could not be reached; it finds the release on its next hourly sweep."
+            exit 0
+          fi
+          if [ "$code" = 200 ]; then
+            echo "The registry queued stacksjs.com/bun."
+          else
+            echo "::warning::The registry answered $code; it finds the release on its next hourly sweep."
+          fi
 

@@ -72,6 +72,20 @@ A release is an official release with our changes on it, never this branch as it
 
 So a new official release becomes ours without anyone asking, as long as the changes still fit it.
 
+## Installing it
+
+With [pantry](https://github.com/pantry-pm/pantry), as `stacksjs.com/bun`, in place of `bun.com`:
+
+```yaml
+# deps.yaml
+dependencies:
+  stacksjs.com/bun: ^1.4.4
+```
+
+The version there is the official version plus the number of our release of it: `bun-v1.4.4-stacks.2` is `1.4.4.2`, and `^1.4.4` takes the newest. It installs `bun` and `bunx`, as `bun.com` does, so a project has one or the other. The registry publishes each release within the hour (the build tells it; it also looks by itself), after checking the download against `SHASUMS256.txt` and that the binary has the calls.
+
+Without pantry, the zips of a release are the official ones in name and layout.
+
 ## When upstream changes the same code
 
 There are two moments this can show, and the first is the reason the branch follows `main`:
@@ -109,7 +123,7 @@ A build takes about 20 minutes on Linux and 30 on macOS. GitHub's macOS arm64 ru
 
 What is not done:
 
-- **The Linux binary needs glibc 2.43**, the runner's. Upstream links against a glibc 2.31 sysroot so its binary runs on older distributions; that sysroot is not provisioned here yet (the recipe is in upstream's `scripts/build/ci-images/spec.ts`, see `stacks/BUILDING.md`).
+- **The Linux binary needs glibc 2.39** (Ubuntu 24.04, Debian 13), where upstream's runs on 2.17. Upstream links against a glibc 2.31 sysroot; that sysroot is not provisioned here yet (the recipe is in upstream's `scripts/build/ci-images/spec.ts`, see `stacks/BUILDING.md`), so the binary needs the glibc of the runner that built it. That runner is `ubuntu-24.04` by name, and a build whose binary needs anything newer fails. `bun-v1.4.4-stacks.1` was built on `ubuntu-latest` after it became 26.04: it needs glibc 2.43, and does not start on 24.04.
 - **Two targets of upstream's eighteen.** No `linux-aarch64`, musl, Windows, FreeBSD or Android builds, and no `-profile` zips. On Windows the calls answer that there is nothing to wait on.
 - **No cross-language LTO**, which upstream ships with. It needs far more memory at link than a hosted runner has.
 - **TLS connections are not covered by the tests.** The code path is the event loop's own, but no test server here speaks TLS.
