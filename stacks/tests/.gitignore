@@ -1,0 +1,4 @@
+# Copied in from test/js/sql for a run: see run.sh.
+sql-sync.test.ts
+docker-tls/
+mysql-tls/

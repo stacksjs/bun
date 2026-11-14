@@ -11,7 +11,8 @@ The `stacks` branch is upstream's `main` with our commits on it. It is merged fr
 What is ours in the tree:
 
 - **The changes to Bun's own source.** Ordinary commits. Today that is one change, described below.
-- `stacks/` - what belongs to the fork and not to Bun: `tests/` (run against every binary that is built), `patches/<tag>/` (a patch series pinned for one official release), `UPSTREAM` (the upstream commit this branch last merged) and `BUILDING.md`.
+- `test/js/sql/sql-sync.test.ts` and a section of `docs/runtime/sql.mdx` - the tests and the documentation of that change, where Bun keeps its own.
+- `stacks/` - what belongs to the fork and not to Bun: `tests/` (how those tests are run here, against every binary that is built), `patches/<tag>/` (a patch series pinned for one official release), `UPSTREAM` (the upstream commit this branch last merged) and `BUILDING.md`.
 - `.github/workflows/stacks-sync.yml` - merges upstream, and starts a build when there is something to build.
 - `.github/workflows/stacks-build.yml` - builds, tests and publishes.
 
@@ -59,7 +60,9 @@ The calling thread blocks on the socket of the one connection that has the answe
 
 It follows that a statement cannot be waited for when what it needs can only come from the event loop: a connection that code which `await`s is holding, or a password that is a promise. `wait()` says so with `null` instead of blocking for nothing.
 
-Two things the event loop would otherwise do are done by the waiting call: a dial that failed because the server was still starting is tried again after its pause, and once a second the idle connections are read, so one that the server closed while the program did not yield leaves the pool before a statement is put on it.
+Three things the event loop would otherwise do are done by the waiting call. A dial that failed because the server was still starting is tried again after its pause. Once a second the idle connections are read, so one that the server closed while the program did not yield leaves the pool before a statement is put on it. And `connectionTimeout` and `idleTimeout` are timers of the event loop, so a wait ends when one is due and fails the connection as the timer would: a server that accepts and then says nothing does not hold the caller for ever.
+
+Two more cases answer `null`. A `COPY` query read with `readable()` or fed with `writable()` waits for code of the same program, which is the code that would block. And on macOS, a name that the system resolver is already looking up for a caller that awaits: only the event loop reads that answer. A dial that a waiting call starts itself is resolved on the thread pool, where it can see the answer; every other dial resolves as Bun always has.
 
 ### Who uses it
 
@@ -73,7 +76,7 @@ A release is an official release with our changes on it, never this branch as it
 
 1. checks the tag out from oven-sh/bun;
 2. puts our changes on it: the series in `stacks/patches/<tag>/` if that tag has one, otherwise everything this branch changes in Bun's source (the difference to `stacks/UPSTREAM`, without `.github` and `stacks/`), merged onto the tag three ways;
-3. builds each target, and runs `stacks/tests/` with the binary it built, against a real PostgreSQL 17 and a real MySQL 8.4;
+3. builds each target, and runs the tests with the binary it built (see "The tests" below);
 4. publishes, if every target built and passed. A target that fails fails the build, and nothing is published: the previous release stays the latest.
 
 So a new official release becomes ours without anyone asking, as long as the changes still fit it.
@@ -91,6 +94,21 @@ dependencies:
 The version there is the official version plus the number of our release of it: `bun-v1.4.4-stacks.2` is `1.4.4.2`, and `^1.4.4` takes the newest. It installs `bun` and `bunx`, as `bun.com` does, so a project has one or the other. The registry publishes each release within the hour (the build tells it; it also looks by itself), after checking the download against `SHASUMS256.txt` and that the binary has the calls.
 
 Without pantry, the zips of a release are the official ones in name and layout.
+
+## The tests
+
+`test/js/sql/sql-sync.test.ts` is written for Bun's test suite: it asks Bun's harness for a container per server (`postgres_plain`, `postgres_tls`, `mysql_plain`, `mysql_tls`) and has two tests for SQLite. Here the same file runs with `stacks/tests/harness.ts` in the harness's place, which takes the servers from the environment instead of starting containers:
+
+```bash
+SYNC_SQL_POSTGRES_PLAIN=127.0.0.1:5432 SYNC_SQL_MYSQL_PLAIN=127.0.0.1:3306 \
+  stacks/tests/run.sh path/to/bun
+```
+
+`harness.ts` says what each server has to be. One that is not named is skipped, unless `SYNC_SQL_REQUIRE` lists it. The build runs all four on Linux (PostgreSQL 17 and MySQL 8.4, the TLS ones built from the Dockerfiles and certificates in `test/js/sql`) and the two plain ones on macOS, whose runner has no docker.
+
+## Upstream
+
+The change was proposed to Bun as [oven-sh/bun#48947](https://github.com/oven-sh/bun/issues/48947), with [oven-sh/bun#48948](https://github.com/oven-sh/bun/pull/48948) as the implementation. The issue was closed as not planned: `Bun.sql` is async on every adapter by design, and Bun does not want a call in the runtime that blocks the JS thread on a network socket. The suggested alternative is the worker thread that bun-query-builder already uses on official Bun. So this fork is where the change lives.
 
 ## When upstream changes the same code
 
@@ -123,13 +141,13 @@ A merge of upstream carries upstream's commits, and some of those change upstrea
 
 ## Status
 
-Released: the changes above, on `bun-v1.4.4`. The build they were accepted on is [run 43422719236](https://github.com/stacksjs/bun/actions/runs/43422719236): 32 of 32 tests on `linux-x64` (`ubuntu-latest`) and on `darwin-aarch64` (`macos-15`).
+Released: the changes above, on `bun-v1.4.4`. Every release is built by a run of `stacks-build` that passed the tests on both targets; the release notes name the run.
 
 A build takes about 20 minutes on Linux and 30 on macOS. GitHub's macOS arm64 runners can be short: a job that no runner takes within 15 minutes is cancelled, and that job has to be run again.
 
 What is not done:
 
 - **The Linux binary needs glibc 2.39** (Ubuntu 24.04, Debian 13), where upstream's runs on 2.17. Upstream links against a glibc 2.31 sysroot; that sysroot is not provisioned here yet (the recipe is in upstream's `scripts/build/ci-images/spec.ts`, see `stacks/BUILDING.md`), so the binary needs the glibc of the runner that built it. That runner is `ubuntu-24.04` by name, and a build whose binary needs anything newer fails. `bun-v1.4.4-stacks.1` was built on `ubuntu-latest` after it became 26.04: it needs glibc 2.43, and does not start on 24.04.
-- **Two targets of upstream's eighteen.** No `linux-aarch64`, musl, Windows, FreeBSD or Android builds, and no `-profile` zips. On Windows the calls answer that there is nothing to wait on.
+- **Two targets of upstream's eighteen.** No `linux-aarch64`, musl, Windows, FreeBSD or Android builds, and no `-profile` zips.
 - **No cross-language LTO**, which upstream ships with. It needs far more memory at link than a hosted runner has.
-- **TLS connections are not covered by the tests.** The code path is the event loop's own, but no test server here speaks TLS.
+- **Windows.** The wait is written against the epoll and kqueue loop. Under libuv `wait()` answers `null`, so `executeSync()` throws: use `await` there.

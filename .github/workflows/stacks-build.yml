@@ -200,13 +200,14 @@ jobs:
               # Everything this branch changes in Bun's own source: the
               # difference between it and the upstream commit it last merged
               # (stacks/UPSTREAM), leaving out what is only the fork's
-              # (.github, stacks/). Merged onto the tag three ways, so what
+              # (.github, stacks/) and what does not go into the binary (docs/,
+              # test/: the tests are run from this branch). Merged onto the tag three ways, so what
               # upstream changed elsewhere between the two is the tag's.
               base="$(tr -d '[:space:]' < "$fork/stacks/UPSTREAM")"
               echo "This branch's changes since upstream ${base}"
               git -C "$fork" fetch --quiet --depth 1 origin "$base"
-              git -C "$fork" diff --binary "$base" HEAD -- . ':(exclude).github' ':(exclude)stacks' > "$RUNNER_TEMP/stacks.patch"
-              git -C "$fork" diff --stat "$base" HEAD -- . ':(exclude).github' ':(exclude)stacks'
+              git -C "$fork" diff --binary "$base" HEAD -- . ':(exclude).github' ':(exclude)stacks' ':(exclude)docs' ':(exclude)test' > "$RUNNER_TEMP/stacks.patch"
+              git -C "$fork" diff --stat "$base" HEAD -- . ':(exclude).github' ':(exclude)stacks' ':(exclude)docs' ':(exclude)test'
               # The blobs the changes were made against, for the three-way merge.
               git fetch --quiet --depth 1 origin "$base"
               if ! git apply --3way --index "$RUNNER_TEMP/stacks.patch"; then
@@ -522,33 +523,53 @@ jobs:
 
       # ────────────────────────────── tests ──────────────────────────────
       # What the patches add, run by the binary that was just built, against a
-      # real PostgreSQL and a real MySQL. Nothing is released that did not
+      # real PostgreSQL and a real MySQL, each plain and (on Linux) over TLS. Nothing is released that did not
       # pass: the release job needs every target's job, and these are its last
       # steps. After the upload, so a binary that fails them can be fetched
       # and looked at.
 
-      - name: Start PostgreSQL and MySQL (Linux)
+      - name: Start PostgreSQL and MySQL, plain and TLS (Linux)
         if: runner.os == 'Linux' && env.PATCH_COUNT != '0'
         run: |
+          # The servers the test file names, as Bun's own docker compose makes them
+          # (test/docker/docker-compose.yml): a database bun_sql_test on each, and the
+          # two TLS-only ones built from the Dockerfiles and certificates beside the test.
+          sql="$GITHUB_WORKSPACE/fork/test/js/sql"
           docker run -d --name pg -e POSTGRES_HOST_AUTH_METHOD=trust -p 5432:5432 postgres:17
-          docker run -d --name my -e MYSQL_ALLOW_EMPTY_PASSWORD=yes -e MYSQL_DATABASE=test -p 3306:3306 mysql:8.4
-          for i in $(seq 1 90); do
-            if docker exec pg pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1 \
-              && docker exec my mysqladmin ping -h 127.0.0.1 -uroot --silent >/dev/null 2>&1; then
-              break
-            fi
+          docker run -d --name my -e MYSQL_ALLOW_EMPTY_PASSWORD=yes -e MYSQL_DATABASE=bun_sql_test -p 3306:3306 mysql:8.4
+          docker build --quiet --tag bun-postgres-tls "$sql/docker-tls"
+          docker run -d --name pgtls --init -e POSTGRES_HOST_AUTH_METHOD=trust -p 5433:5432 bun-postgres-tls \
+            postgres -c hba_file=/etc/postgresql/pg_hba.conf -c ssl=on \
+            -c ssl_cert_file=/etc/postgresql/ssl/server.crt -c ssl_key_file=/etc/postgresql/ssl/server.key
+          docker build --quiet --tag bun-mysql-tls --build-arg MYSQL_VERSION=8.4 "$sql/mysql-tls"
+          docker run -d --name mytls -p 3307:3306 bun-mysql-tls
+          ready() {
+            docker exec pg pg_isready -U postgres -h 127.0.0.1 \
+              && docker exec my mysql -h 127.0.0.1 -uroot -e 'select 1' bun_sql_test \
+              && docker exec pgtls psql -U postgres -d bun_sql_test -c 'select 1' \
+              && docker exec mytls mysql -h 127.0.0.1 -uroot -pbun -e 'select 1' bun_sql_test
+          }
+          for i in $(seq 1 120); do
+            if ready >/dev/null 2>&1; then break; fi
             sleep 2
           done
-          docker exec pg pg_isready -U postgres -h 127.0.0.1
-          docker exec my mysqladmin ping -h 127.0.0.1 -uroot
-          echo "POSTGRES_URL=postgres://postgres@127.0.0.1:5432/postgres" >> "$GITHUB_ENV"
-          echo "MYSQL_URL=mysql://root@127.0.0.1:3306/test" >> "$GITHUB_ENV"
+          ready
+          docker exec pg psql -U postgres -v ON_ERROR_STOP=1 \
+            -c 'create role bun_sql_test login' -c 'create database bun_sql_test owner bun_sql_test'
+          {
+            echo "SYNC_SQL_POSTGRES_PLAIN=127.0.0.1:5432"
+            echo "SYNC_SQL_MYSQL_PLAIN=127.0.0.1:3306"
+            echo "SYNC_SQL_POSTGRES_TLS=127.0.0.1:5433"
+            echo "SYNC_SQL_MYSQL_TLS=127.0.0.1:3307"
+            echo "SYNC_SQL_REQUIRE=postgres_plain,mysql_plain,postgres_tls,mysql_tls"
+          } >> "$GITHUB_ENV"
 
       - name: Start PostgreSQL and MySQL (macOS)
         if: runner.os == 'macOS' && env.PATCH_COUNT != '0'
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
         run: |
+          # Plain only: the TLS servers are Linux images, and the runner has no docker.
           brew install postgresql@17 mysql
           brew services start postgresql@17
           brew services start mysql
@@ -562,18 +583,21 @@ jobs:
           done
           "$pg_bin/pg_isready" -h 127.0.0.1
           mysqladmin ping -h 127.0.0.1 -uroot
-          mysql -h 127.0.0.1 -uroot -e 'create database if not exists test'
-          echo "POSTGRES_URL=postgres://$(whoami)@127.0.0.1:5432/postgres" >> "$GITHUB_ENV"
-          echo "MYSQL_URL=mysql://root@127.0.0.1:3306/test" >> "$GITHUB_ENV"
+          "$pg_bin/psql" -h 127.0.0.1 -d postgres -v ON_ERROR_STOP=1 \
+            -c 'create role bun_sql_test login' -c 'create database bun_sql_test owner bun_sql_test'
+          mysql -h 127.0.0.1 -uroot -e 'create database if not exists bun_sql_test'
+          {
+            echo "SYNC_SQL_POSTGRES_PLAIN=127.0.0.1:5432"
+            echo "SYNC_SQL_MYSQL_PLAIN=127.0.0.1:3306"
+            echo "SYNC_SQL_REQUIRE=postgres_plain,mysql_plain"
+          } >> "$GITHUB_ENV"
 
       - name: Run the tests with the built binary
         if: env.PATCH_COUNT != '0'
-        working-directory: fork/stacks
-        env:
-          SYNC_SQL_REQUIRE: "1"
         run: |
-          "$GITHUB_WORKSPACE/bun/build/release/bun" --revision
-          "$GITHUB_WORKSPACE/bun/build/release/bun" test tests/
+          # Bun's own test file for the change (test/js/sql/sql-sync.test.ts), with
+          # stacks/tests/harness.ts in the place of Bun's docker harness.
+          "$GITHUB_WORKSPACE/fork/stacks/tests/run.sh" "$GITHUB_WORKSPACE/bun/build/release/bun"
 
       # ─────────────────────────── diagnostics ───────────────────────────
 
