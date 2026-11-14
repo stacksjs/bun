@@ -550,7 +550,7 @@ index 090f200cb..c7b0e31cb 100644
                      session: self.ref_guard(),
                      request: request.ref_guard(),
 diff --git a/src/sql_jsc/shared/ConnectionTimers.rs b/src/sql_jsc/shared/ConnectionTimers.rs
-index d9394da9d..20e02e5de 100644
+index d9394da9d..e111cfb76 100644
 --- a/src/sql_jsc/shared/ConnectionTimers.rs
 +++ b/src/sql_jsc/shared/ConnectionTimers.rs
 @@ -114,6 +114,30 @@ pub trait TimedConnection {
@@ -564,11 +564,11 @@ index d9394da9d..20e02e5de 100644
 +    /// then does what the loop would have done (`fire_timeout_if_due`).
 +    fn ms_until_timeout(&self) -> Option<i64> {
 +        let timer = &self.timers().timer;
-+        if timer.state.get() != EventLoopTimerState::ACTIVE {
++        if timer.get().state != EventLoopTimerState::ACTIVE {
 +            return None;
 +        }
 +        let now = Timespec::now(TimespecMockMode::ForceRealTime);
-+        Some(timer.next.get().duration(&now).ms().max(0))
++        Some(timer.get().next.duration(&now).ms().max(0))
 +    }
 +
 +    /// true when the timeout was due and has been acted on.
